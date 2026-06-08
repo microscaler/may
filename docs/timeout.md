@@ -257,7 +257,13 @@ Both sender unpark and timer unpark use `wait_co.take()` — **at most one** wak
 | `recv_with_timeout_timer_wins` | No sender → `Err(Timeout)` ~50ms |
 | `recv_with_timeout_data_before_timeout` | Delayed send → `Ok` before 5s |
 | `recv_with_timeout_disconnect` | Drop sender → `Err(Disconnected)` |
-| `recv_with_timeout_zero_duration` | Empty → immediate `Err(Timeout)` |
+| `recv_with_timeout_zero_duration_*` | `Duration::ZERO` → immediate `Ok`/`Timeout` |
+| `recv_with_timeout_send_wins_while_waiting` | Send races parked recv → `Ok` |
+| `recv_with_timeout_drop_sender_while_waiting` | Drop sender during wait → `Disconnected` |
+| `recv_with_timeout_canceled_while_waiting` | Cancel during wait → coroutine join error |
+| `recv_with_timeout_late_send_after_timeout` | Timeout then later send → next recv `Ok` |
+| `recv_with_timeout_stress_timeouts_and_sends` | 50× timeout/send cycles (× stress factor) |
+| Thread-path mirrors | Same scenarios via `park_timeout` |
 
 **Merge checklist:**
 
@@ -416,3 +422,4 @@ pub enum RecvError {
 |------|--------|
 | 2026-06-05 | Initial DRAFT |
 | 2026-06-05 | Revised: aligned with `may-sleep` implementation; Phase 2 may-redis plan; resolved open questions; fixed race table and API docs |
+| 2026-06-07 | Expanded test matrix: 24 `recv_with_timeout` unit tests (zero timeout, send/timer races, cancel, disconnect, stress) |

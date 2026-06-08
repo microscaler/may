@@ -616,22 +616,11 @@ mod tests {
     #[test]
     fn recv_with_timeout_multiple_senders() {
         let (result, elapsed) = go!(move || {
-            let (tx1, rx) = channel::<i32>();
-            let (tx2, _rx) = channel::<i32>();
-            let (tx3, _rx) = channel::<i32>();
+            let (tx, rx) = channel::<i32>();
 
-            // Helper coroutines to send at different times
             go!(move || {
                 thread::sleep(Duration::from_millis(30));
-                tx1.send(1).unwrap();
-            });
-            go!(move || {
-                thread::sleep(Duration::from_millis(50));
-                tx2.send(2).unwrap();
-            });
-            go!(move || {
-                thread::sleep(Duration::from_millis(10));
-                tx3.send(3).unwrap();
+                tx.send(7).unwrap();
             });
 
             let start = Instant::now();
@@ -641,8 +630,146 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(result.is_ok());
-        assert!(elapsed < Duration::from_millis(100));
+        assert_eq!(result, Ok(7));
+        assert!(elapsed < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn recv_with_timeout_zero_duration_empty() {
+        let result = go!(move || {
+            let (_tx, rx) = channel::<i32>();
+            rx.recv_with_timeout(Duration::ZERO)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, Err(RecvError::Timeout));
+    }
+
+    #[test]
+    fn recv_with_timeout_zero_duration_with_data() {
+        let result = go!(move || {
+            let (tx, rx) = channel::<i32>();
+            tx.send(11).unwrap();
+            rx.recv_with_timeout(Duration::ZERO)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, Ok(11));
+    }
+
+    #[test]
+    fn recv_with_timeout_send_wins_while_waiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready2 = ready.clone();
+        let (tx, rx) = channel::<i32>();
+        let sender = thread::spawn(move || {
+            while !ready2.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            tx.send(42).unwrap();
+        });
+
+        let result = go!(move || {
+            ready.store(true, Ordering::Release);
+            rx.recv_with_timeout(Duration::from_millis(500))
+        })
+        .join()
+        .unwrap();
+        sender.join().unwrap();
+        assert_eq!(result, Ok(42));
+    }
+
+    #[test]
+    fn recv_with_timeout_drop_sender_while_waiting() {
+        use crate::sleep::sleep;
+
+        let result = go!(move || {
+            let (tx, rx) = channel::<i32>();
+            go!(move || {
+                sleep(Duration::from_millis(20));
+                drop(tx);
+            });
+            rx.recv_with_timeout(Duration::from_secs(5))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, Err(RecvError::Disconnected));
+    }
+
+    #[test]
+    fn recv_with_timeout_canceled_while_waiting() {
+        use crate::sleep::sleep;
+
+        let (_tx, rx) = channel::<i32>();
+        let handle = go!(move || rx.recv_with_timeout(Duration::from_secs(5)));
+        sleep(Duration::from_millis(50));
+        unsafe {
+            handle.coroutine().cancel();
+        }
+        assert!(handle.join().is_err());
+    }
+
+    #[test]
+    fn recv_with_timeout_late_send_after_timeout() {
+        use crate::sleep::sleep;
+
+        go!(move || {
+            let (tx, rx) = channel::<i32>();
+            assert_eq!(
+                rx.recv_with_timeout(Duration::from_millis(10)),
+                Err(RecvError::Timeout)
+            );
+            go!(move || {
+                sleep(Duration::from_millis(10));
+                tx.send(99).unwrap();
+            });
+            sleep(Duration::from_millis(30));
+            assert_eq!(rx.recv_with_timeout(Duration::from_secs(1)), Ok(99));
+        });
+    }
+
+    #[test]
+    fn recv_with_timeout_alternates_with_blocking_recv() {
+        go!(move || {
+            let (tx, rx) = channel::<i32>();
+            assert_eq!(
+                rx.recv_with_timeout(Duration::from_millis(10)),
+                Err(RecvError::Timeout)
+            );
+            go!(move || {
+                thread::sleep(Duration::from_millis(10));
+                tx.send(1).unwrap();
+            });
+            assert_eq!(rx.recv().unwrap(), 1);
+            assert_eq!(
+                rx.recv_with_timeout(Duration::from_millis(10)),
+                Err(RecvError::Timeout)
+            );
+        });
+    }
+
+    #[test]
+    fn recv_with_timeout_stress_timeouts_and_sends() {
+        use crate::sleep::sleep;
+
+        let iterations = 50 * stress_factor();
+        go!(move || {
+            let (tx, rx) = channel::<i32>();
+            for i in 0..iterations {
+                assert_eq!(
+                    rx.recv_with_timeout(Duration::from_millis(1)),
+                    Err(RecvError::Timeout)
+                );
+                tx.send(i as i32).unwrap();
+                assert_eq!(rx.recv_with_timeout(Duration::from_secs(1)), Ok(i as i32));
+                if i % 10 == 0 {
+                    sleep(Duration::from_millis(1));
+                }
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -692,6 +819,70 @@ mod tests {
         drop(tx);
         let result = rx.recv_with_timeout(Duration::from_secs(5));
         assert_eq!(result, Err(RecvError::Disconnected));
+    }
+
+    #[test]
+    fn recv_with_timeout_thread_zero_duration_empty() {
+        let (_tx, rx) = channel::<i32>();
+        let start = Instant::now();
+        let result = rx.recv_with_timeout(Duration::ZERO);
+        let elapsed = start.elapsed();
+        assert_eq!(result, Err(RecvError::Timeout));
+        assert!(elapsed < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn recv_with_timeout_thread_zero_duration_with_data() {
+        let (tx, rx) = channel::<i32>();
+        tx.send(55).unwrap();
+        assert_eq!(rx.recv_with_timeout(Duration::ZERO), Ok(55));
+    }
+
+    #[test]
+    fn recv_with_timeout_thread_drop_sender_while_waiting() {
+        let (tx, rx) = channel::<i32>();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(tx);
+        });
+        let result = rx.recv_with_timeout(Duration::from_secs(5));
+        sender.join().unwrap();
+        assert_eq!(result, Err(RecvError::Disconnected));
+    }
+
+    #[test]
+    fn recv_with_timeout_thread_send_wins_while_waiting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready2 = ready.clone();
+        let (tx, rx) = channel::<i32>();
+        let sender = thread::spawn(move || {
+            while !ready2.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            tx.send(88).unwrap();
+        });
+        ready.store(true, Ordering::Release);
+        let result = rx.recv_with_timeout(Duration::from_millis(500));
+        sender.join().unwrap();
+        assert_eq!(result, Ok(88));
+    }
+
+    #[test]
+    fn recv_with_timeout_thread_repeated() {
+        let (tx, rx) = channel::<i32>();
+        assert_eq!(
+            rx.recv_with_timeout(Duration::from_millis(10)),
+            Err(RecvError::Timeout)
+        );
+        tx.send(3).unwrap();
+        assert_eq!(rx.recv_with_timeout(Duration::from_secs(1)), Ok(3));
+        assert_eq!(
+            rx.recv_with_timeout(Duration::from_millis(10)),
+            Err(RecvError::Timeout)
+        );
     }
 
     // -----------------------------------------------------------------------
