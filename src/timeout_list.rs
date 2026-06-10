@@ -189,18 +189,14 @@ impl<T> TimeOutList<T> {
             // first peek the BH to see if there is any timeout event
             let mut entry = {
                 let mut timer_bh = self.timer_bh.lock();
-                let top_entry = timer_bh.peek();
-                match top_entry {
-                    // the latest timeout event not happened yet
-                    Some(entry) => {
-                        if entry.time > now {
-                            return Some(entry.time - now);
-                        } else {
-                            // find out one entry
-                        }
-                    }
-                    None => return None,
+                let top_entry = timer_bh.peek()?;
+
+                // the latest timeout event not happened yet
+                if top_entry.time > now {
+                    return Some(top_entry.time - now);
                 }
+
+                // find out one entry
                 let entry = timer_bh.pop().unwrap();
                 entry.list.in_use.store(0, Ordering::Release);
                 entry
