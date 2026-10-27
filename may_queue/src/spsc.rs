@@ -3,12 +3,14 @@ use smallvec::SmallVec;
 
 use crate::atomic::{AtomicPtr, AtomicUsize};
 
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::cmp;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 // size for block_node
 pub const BLOCK_SIZE: usize = 1 << BLOCK_SHIFT;
@@ -23,13 +25,6 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T> Slot<T> {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const UNINIT: Self = Self {
-        value: UnsafeCell::new(MaybeUninit::uninit()),
-    };
-}
-
 /// a block node contains a bunch of items stored in a array
 /// this could make the malloc/free not that frequent, also
 /// the array could speed up list operations
@@ -42,13 +37,29 @@ struct BlockNode<T> {
 /// the queue is responsible to drop all the items
 /// and would call its get() method for the dropping
 impl<T> BlockNode<T> {
-    /// create a new BlockNode with uninitialized data
-    #[inline]
+    /// Allocate the block directly on the heap.
+    ///
+    /// `Box::new(BlockNode { .. })` first materialises the whole node -
+    /// BLOCK_SIZE slots of `T` - on the caller's stack and then moves it to
+    /// the heap. With a large `T` on a small coroutine stack that is a
+    /// guard-page hit at an arbitrary push, and a coroutine killed by stack
+    /// overflow does not unwind, so the queue is left corrupted mid-push
+    /// and every later consumer blocks forever.
+    ///
+    /// `alloc_zeroed` never touches the stack: zeroed memory is a valid
+    /// state for every field here (atomics at 0 / null, `MaybeUninit`
+    /// slots), and any non-zero field is written through a raw pointer, so
+    /// no `BlockNode` value ever exists on the stack. Blocks are freed with
+    /// `Box::from_raw`, which pairs with the global allocator used here.
     fn new() -> *mut BlockNode<T> {
-        Box::into_raw(Box::new(BlockNode {
-            next: AtomicPtr::new(ptr::null_mut()),
-            data: [Slot::UNINIT; BLOCK_SIZE],
-        }))
+        unsafe {
+            let layout = std::alloc::Layout::new::<BlockNode<T>>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<BlockNode<T>>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            ptr
+        }
     }
 
     /// write index with data
@@ -137,8 +148,9 @@ pub struct Queue<T> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T: Send> Send for Queue<T> {}
-unsafe impl<T: Send> Sync for Queue<T> {}
+// Sync implementation for Queue does not allow for unsynchronised concurrent push/pop operations.
+// unsafe impl<T: Send> Send for Queue<T> {}
+// unsafe impl<T: Send> Sync for Queue<T> {}
 
 impl<T> Queue<T> {
     /// create a spsc queue
@@ -159,20 +171,21 @@ impl<T> Queue<T> {
     #[inline]
     #[cfg(feature = "inner_cache")]
     fn alloc_node(&self) -> *mut BlockNode<T> {
-        let first = unsafe { &mut *self.first.unsync_load() };
-        let mut last_head = unsafe { &mut *self.last_head.unsync_load() };
+        let first = unsafe { self.first.unsync_load() };
+        let mut last_head = unsafe { self.last_head.unsync_load() };
         if !ptr::eq(first, last_head) {
-            let next = unsafe { first.next.unsync_load() };
+            let next = unsafe { (*first).next.unsync_load() };
             self.first.store(next, Ordering::Relaxed);
             // first.next.store(ptr::null_mut(), Ordering::Relaxed);
             return first;
         }
 
-        last_head = unsafe { &mut *self.head.block.unsync_load() };
+        // the consumer updates the head concurrently, and has finished reading the blocks before it
+        last_head = self.head.block.load(Ordering::Acquire);
         self.last_head.store(last_head, Ordering::Relaxed);
 
         if !ptr::eq(first, last_head) {
-            let next = unsafe { first.next.unsync_load() };
+            let next = unsafe { (*first).next.unsync_load() };
             self.first.store(next, Ordering::Relaxed);
             // first.next.store(ptr::null_mut(), Ordering::Relaxed);
             first
@@ -183,7 +196,7 @@ impl<T> Queue<T> {
 
     /// push a value to the queue
     pub fn push(&self, v: T) {
-        let tail = unsafe { &mut *self.tail.block.unsync_load() };
+        let tail = unsafe { &*self.tail.block.unsync_load() };
         let push_index = unsafe { self.tail.index.unsync_load() };
         // store the data
         tail.set(push_index, v);
@@ -214,7 +227,7 @@ impl<T> Queue<T> {
             return None;
         }
 
-        let head = &mut *self.head.block.unsync_load();
+        let head = &*self.head.block.unsync_load();
         Some(head.peek(index))
     }
 
@@ -226,7 +239,8 @@ impl<T> Queue<T> {
             return None;
         }
 
-        let head = unsafe { &mut *self.head.block.unsync_load() };
+        let head_ptr = unsafe { self.head.block.unsync_load() };
+        let head = unsafe { &*head_ptr };
         // get the data
         let v = head.get(index & BLOCK_MASK);
 
@@ -236,8 +250,8 @@ impl<T> Queue<T> {
             let new_head = head.next.load(Ordering::Relaxed);
             // assert!(!new_head.is_null());
             #[cfg(not(feature = "inner_cache"))]
-            let _unused_head = unsafe { Box::from_raw(head) };
-            self.head.block.store(new_head, Ordering::Relaxed);
+            let _unused_head = unsafe { Box::from_raw(head_ptr) };
+            self.head.block.store(new_head, Ordering::Release);
         }
 
         // commit the pop
@@ -269,7 +283,8 @@ impl<T> Queue<T> {
             return SmallVec::new();
         }
 
-        let head = unsafe { &mut *self.head.block.unsync_load() };
+        let head_ptr = unsafe { self.head.block.unsync_load() };
+        let head = unsafe { &*head_ptr };
 
         // only pop within a block
         let end = bulk_end(index, push_index);
@@ -282,8 +297,8 @@ impl<T> Queue<T> {
             let new_head = head.next.load(Ordering::Relaxed);
             // assert!(!new_head.is_null());
             #[cfg(not(feature = "inner_cache"))]
-            let _unused_head = unsafe { Box::from_raw(head) };
-            self.head.block.store(new_head, Ordering::Relaxed);
+            let _unused_head = unsafe { Box::from_raw(head_ptr) };
+            self.head.block.store(new_head, Ordering::Release);
         }
 
         // commit the pop
@@ -291,6 +306,80 @@ impl<T> Queue<T> {
 
         value
     }
+}
+
+/// The producer half of a split [`Queue`]. It is `Send` but not `Sync`.
+pub struct Sender<T> {
+    queue: Arc<Queue<T>>,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+/// The consumer half of a split [`Queue`]. It is `Send` but not `Sync`.
+pub struct Receiver<T> {
+    queue: Arc<Queue<T>>,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl<T> Sender<T> {
+    /// push a value to the queue
+    pub fn push(&mut self, v: T) {
+        self.queue.push(v)
+    }
+
+    /// the number of elements in the queue
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl<T> Receiver<T> {
+    /// pop a value from the queue
+    pub fn pop(&mut self) -> Option<T> {
+        self.queue.pop()
+    }
+
+    /// pop all the currently available values
+    pub fn bulk_pop(&mut self) -> SmallVec<[T; BLOCK_SIZE]> {
+        self.queue.bulk_pop()
+    }
+
+    /// the number of elements in the queue
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+impl<T> Queue<T> {
+    /// split the queue into a `Sender`/`Receiver` pair, each can be sent to
+    /// another thread but can't be shared between threads
+    pub fn split(self) -> (Sender<T>, Receiver<T>) {
+        let queue = Arc::new(self);
+        (
+            Sender {
+                queue: queue.clone(),
+                _not_sync: PhantomData,
+            },
+            Receiver {
+                queue,
+                _not_sync: PhantomData,
+            },
+        )
+    }
+}
+
+/// create a new spsc channel
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    Queue::new().split()
 }
 
 impl<T> Default for Queue<T> {
@@ -301,8 +390,11 @@ impl<T> Default for Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        //  pop all the element to make sure the queue is empty
-        while !self.bulk_pop().is_empty() {}
+        // Drain one item at a time. bulk_pop() returns
+        // SmallVec<[T; BLOCK_SIZE]>, which reserves BLOCK_SIZE payloads
+        // INLINE on the dropping stack - for a large T that alone can
+        // overflow a small coroutine stack. pop() moves one T at a time.
+        while self.pop().is_some() {}
         let head = self.head.block.load(Ordering::Relaxed);
         let tail = self.tail.block.load(Ordering::Relaxed);
         assert_eq!(head, tail);
@@ -323,6 +415,27 @@ impl<T> Drop for Queue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_send_not_sync() {
+        fn is_send<S: Send>() {}
+        is_send::<Sender<usize>>();
+        is_send::<Receiver<usize>>();
+        let (mut tx, mut rx) = Queue::new().split();
+        let h = std::thread::spawn(move || {
+            for i in 0..1000usize {
+                tx.push(i);
+            }
+        });
+        let mut n = 0;
+        while n < 1000 {
+            if let Some(v) = rx.pop() {
+                assert_eq!(v, n);
+                n += 1;
+            }
+        }
+        h.join().unwrap();
+    }
 
     #[test]
     fn queue_sanity() {
@@ -401,7 +514,7 @@ mod bench {
     fn bulk_pop_1p1c_bench(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(Queue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             let _q = q.clone();
             // in other thread the value should be still 100
@@ -437,7 +550,7 @@ mod bench {
     fn multi_1p1c_test(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(Queue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             let _q = q.clone();
             // in other thread the value should be still 100
