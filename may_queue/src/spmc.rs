@@ -23,13 +23,6 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T> Slot<T> {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const UNINIT: Self = Self {
-        value: UnsafeCell::new(MaybeUninit::uninit()),
-    };
-}
-
 /// a block node contains a bunch of items stored in a array
 /// this could make the malloc/free not that frequent, also
 /// the array could speed up list operations
@@ -45,15 +38,31 @@ struct BlockNode<T> {
 /// the queue is responsible to drop all the items
 /// and would call its get() method for the dropping
 impl<T> BlockNode<T> {
-    /// create a new BlockNode with uninitialized data
-    #[inline]
+    /// Allocate the block directly on the heap.
+    ///
+    /// `Box::new(BlockNode { .. })` first materialises the whole node -
+    /// BLOCK_SIZE slots of `T` - on the caller's stack and then moves it to
+    /// the heap. With a large `T` on a small coroutine stack that is a
+    /// guard-page hit at an arbitrary push, and a coroutine killed by stack
+    /// overflow does not unwind, so the queue is left corrupted mid-push
+    /// and every later consumer blocks forever.
+    ///
+    /// `alloc_zeroed` never touches the stack: zeroed memory is a valid
+    /// state for every field here (atomics at 0 / null, `MaybeUninit`
+    /// slots), and any non-zero field is written through a raw pointer, so
+    /// no `BlockNode` value ever exists on the stack. Blocks are freed with
+    /// `Box::from_raw`, which pairs with the global allocator used here.
     fn new(index: usize) -> *mut BlockNode<T> {
-        Box::into_raw(Box::new(BlockNode {
-            next: AtomicPtr::new(ptr::null_mut()),
-            used: AtomicUsize::new(BLOCK_SIZE),
-            data: [Slot::UNINIT; BLOCK_SIZE],
-            start: AtomicUsize::new(index),
-        }))
+        unsafe {
+            let layout = std::alloc::Layout::new::<BlockNode<T>>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<BlockNode<T>>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            ptr::addr_of_mut!((*ptr).used).write(AtomicUsize::new(BLOCK_SIZE));
+            ptr::addr_of_mut!((*ptr).start).write(AtomicUsize::new(index));
+            ptr
+        }
     }
 
     /// write index with data
@@ -80,7 +89,8 @@ impl<T> BlockNode<T> {
     /// if all slots read, then we can safely free the block
     #[inline]
     fn mark_slots_read(&self, size: usize) -> bool {
-        let old = self.used.fetch_sub(size, Ordering::Relaxed);
+        // AcqRel so the thread that frees the block sees all the reads from the other threads
+        let old = self.used.fetch_sub(size, Ordering::AcqRel);
         old == size
     }
 
@@ -122,15 +132,13 @@ impl<T> BlockPtr<T> {
 
     #[inline]
     fn unpack(ptr: *mut BlockNode<T>) -> (*mut BlockNode<T>, usize) {
-        let ptr = ptr as usize;
-        let index = ptr & BLOCK_MASK;
-        let ptr = (ptr & !BLOCK_MASK) as *mut BlockNode<T>;
-        (ptr, index)
+        let index = ptr.addr() & BLOCK_MASK;
+        (ptr.map_addr(|a| a & !BLOCK_MASK), index)
     }
 
     #[inline]
     fn pack(ptr: *const BlockNode<T>, index: usize) -> *mut BlockNode<T> {
-        ((ptr as usize) | index) as *mut BlockNode<T>
+        ptr.cast_mut().map_addr(|a| a | index)
     }
 }
 
@@ -165,7 +173,7 @@ impl<T> Queue<T> {
 
     /// push a value to the back of queue
     pub fn push(&self, v: T) {
-        let tail = unsafe { &mut *self.tail.block.unsync_load() };
+        let tail = unsafe { &*self.tail.block.unsync_load() };
         let push_index = unsafe { self.tail.index.unsync_load() };
         // store the data
         tail.set(push_index, v);
@@ -193,7 +201,7 @@ impl<T> Queue<T> {
         let mut tail_block = self.tail.block.load(Ordering::Acquire);
 
         loop {
-            head = (head as usize & !(1 << 63)) as *mut BlockNode<T>;
+            head = head.map_addr(|a| a & !(1 << 63));
             let (block, id) = BlockPtr::unpack(head);
             if std::ptr::eq(block, tail_block) && id >= (push_index & BLOCK_MASK) {
                 return None;
@@ -202,10 +210,8 @@ impl<T> Queue<T> {
             let new_head = if id != BLOCK_MASK {
                 BlockPtr::pack(block, id + 1)
             } else {
-                (head as usize | (1 << 63)) as *mut BlockNode<T>
+                head.map_addr(|a| a | (1 << 63))
             };
-
-            let block = unsafe { &mut *block };
 
             // commit the pop
             match self.head.0.compare_exchange_weak(
@@ -215,6 +221,9 @@ impl<T> Queue<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    // the block may be stale before the CAS, only deref it after success
+                    let block_ptr = block;
+                    let block = unsafe { &*block_ptr };
                     let block_start = block.start.load(Ordering::Relaxed);
                     let pop_index = block_start + id;
                     if id == BLOCK_MASK {
@@ -240,7 +249,7 @@ impl<T> Queue<T> {
 
                     if block.mark_slots_read(1) {
                         // we need to free the old block
-                        let _unused_block = unsafe { Box::from_raw(block) };
+                        let _unused_block = unsafe { Box::from_raw(block_ptr) };
                     }
                     return Some(v);
                 }
@@ -263,7 +272,7 @@ impl<T> Queue<T> {
         let tail_block = unsafe { self.tail.block.unsync_load() };
 
         loop {
-            head = (head as usize & !(1 << 63)) as *mut BlockNode<T>;
+            head = head.map_addr(|a| a & !(1 << 63));
             let (block, id) = BlockPtr::unpack(head);
             if std::ptr::eq(block, tail_block) && id >= (push_index & BLOCK_MASK) {
                 return None;
@@ -272,10 +281,8 @@ impl<T> Queue<T> {
             let new_head = if id != BLOCK_MASK {
                 BlockPtr::pack(block, id + 1)
             } else {
-                (head as usize | (1 << 63)) as *mut BlockNode<T>
+                head.map_addr(|a| a | (1 << 63))
             };
-
-            let block = unsafe { &mut *block };
 
             // commit the pop
             match self.head.0.compare_exchange_weak(
@@ -285,6 +292,9 @@ impl<T> Queue<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    // the block may be stale before the CAS, only deref it after success
+                    let block_ptr = block;
+                    let block = unsafe { &*block_ptr };
                     let block_start = block.start.load(Ordering::Relaxed);
                     let pop_index = block_start + id;
                     if id == BLOCK_MASK {
@@ -303,7 +313,7 @@ impl<T> Queue<T> {
                         self.tail.index.store(push_index + 1, Ordering::Relaxed);
                         if block.mark_slots_read(1) {
                             // we need to free the old block
-                            let _unused_block = unsafe { Box::from_raw(block) };
+                            let _unused_block = unsafe { Box::from_raw(block_ptr) };
                         }
                         return None;
                     }
@@ -313,7 +323,7 @@ impl<T> Queue<T> {
 
                     if block.mark_slots_read(1) {
                         // we need to free the old block
-                        let _unused_block = unsafe { Box::from_raw(block) };
+                        let _unused_block = unsafe { Box::from_raw(block_ptr) };
                     }
                     return Some(v);
                 }
@@ -332,7 +342,7 @@ impl<T> Queue<T> {
         let mut tail_block = self.tail.block.load(Ordering::Acquire);
 
         loop {
-            head = (head as usize & !(1 << 63)) as *mut BlockNode<T>;
+            head = head.map_addr(|a| a & !(1 << 63));
             let (block, id) = BlockPtr::unpack(head);
             let push_id = push_index & BLOCK_MASK;
             // at least leave one element to the owner
@@ -347,12 +357,11 @@ impl<T> Queue<T> {
             };
 
             let new_head = if new_id == 0 {
-                (head as usize | (1 << 63)) as *mut BlockNode<T>
+                head.map_addr(|a| a | (1 << 63))
             } else {
                 BlockPtr::pack(block, new_id)
             };
 
-            let block = unsafe { &mut *block };
             // only pop within a block
             match self.head.0.compare_exchange_weak(
                 head,
@@ -361,6 +370,9 @@ impl<T> Queue<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    // the block may be stale before the CAS, only deref it after success
+                    let block_ptr = block;
+                    let block = unsafe { &*block_ptr };
                     let block_start = block.start.load(Ordering::Relaxed);
                     let pop_index = block_start + id;
 
@@ -396,7 +408,7 @@ impl<T> Queue<T> {
 
                     if block.mark_slots_read(end - pop_index) {
                         // we need to free the old block
-                        let _unused_block = unsafe { Box::from_raw(block) };
+                        let _unused_block = unsafe { Box::from_raw(block_ptr) };
                     }
                     return value;
                 }
@@ -418,9 +430,9 @@ impl<T> Queue<T> {
     /// return a wrong length
     pub unsafe fn len(&self) -> usize {
         let head = self.head.0.load(Ordering::Acquire);
-        let head = (head as usize & !(1 << 63)) as *mut BlockNode<T>;
+        let head = head.map_addr(|a| a & !(1 << 63));
         let (block, id) = BlockPtr::unpack(head);
-        let block = unsafe { &mut *block };
+        let block = unsafe { &*block };
         // it's unsafe to deref the block, because it could be a destroyed one
         // we'd better use AtomicUsize index to calc the length
         // both the tail and head are just shadows of the real tail and head
@@ -433,7 +445,7 @@ impl<T> Queue<T> {
     /// if the queue is empty
     pub fn is_empty(&self) -> bool {
         let head = self.head.0.load(Ordering::Acquire);
-        let head = (head as usize & !(1 << 63)) as *mut BlockNode<T>;
+        let head = head.map_addr(|a| a & !(1 << 63));
         let (block, id) = BlockPtr::unpack(head);
 
         let push_index = self.tail.index.load(Ordering::Acquire);
@@ -451,8 +463,11 @@ impl<T> Default for Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        //  pop all the element to make sure the queue is empty
-        while !self.bulk_pop().is_empty() {}
+        // Drain one item at a time. bulk_pop() returns
+        // SmallVec<[T; BLOCK_SIZE]>, which reserves BLOCK_SIZE payloads
+        // INLINE on the dropping stack - for a large T that alone can
+        // overflow a small coroutine stack. pop() moves one T at a time.
+        while self.pop().is_some() {}
         let head = self.head.0.load(Ordering::Acquire);
         let (block, _id) = BlockPtr::unpack(head);
         let tail = self.tail.block.load(Ordering::Acquire);
@@ -602,7 +617,7 @@ mod test {
     fn multi_1p1c_test(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(Queue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             let _q = q.clone();
             // in other thread the value should be still 100
@@ -623,7 +638,7 @@ mod test {
     fn multi_crossbeam_1p1c_test(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(crossbeam_queue::SegQueue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             let _q = q.clone();
             // in other thread the value should be still 100
@@ -644,7 +659,7 @@ mod test {
     fn multi_1p2c_test(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(Queue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             // in other thread the value should be still 100
             for i in 0..total_work {
@@ -673,7 +688,7 @@ mod test {
     fn multi_crossbeam_1p2c_test(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(crossbeam_queue::SegQueue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             // in other thread the value should be still 100
             for i in 0..total_work {
@@ -702,7 +717,7 @@ mod test {
     fn bulk_1p2c_test(b: &mut Bencher) {
         b.iter(|| {
             let q = Arc::new(Queue::new());
-            let total_work: usize = 1_000_000;
+            let total_work: usize = if cfg!(miri) { 200 } else { 1_000_000 };
             // create worker threads that generate mono increasing index
             // in other thread the value should be still 100
             for i in 0..total_work {
