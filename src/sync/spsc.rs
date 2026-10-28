@@ -28,25 +28,29 @@ pub enum RecvError {
     Timeout,
 }
 
-/// EventSource for recv_with_timeout that combines:
-/// - storing the coroutine in wait_co (so send() can take it)
-/// - registering a scheduler timer
-struct RecvTimeoutSource<'a, T> {
-    queue: &'a InnerQueue<T>,
+/// EventSource for `recv_timeout`. It holds its own reference to the queue:
+/// once the coroutine is reachable by `send()` or the timer it may resume,
+/// finish and drop the channel on another worker while `subscribe` still runs.
+struct RecvTimeoutSource<T> {
+    queue: Arc<InnerQueue<T>>,
     timeout: Duration,
 }
 
-impl<T> EventSource for RecvTimeoutSource<'_, T> {
+impl<T> EventSource for RecvTimeoutSource<T> {
     fn subscribe(&mut self, co: CoroutineImpl) {
         let cancel = co_cancel_data(&co);
         // Shared between the scheduler timer and `send()` wakeup (see `timeout_wait`).
         let wait_co = Arc::new(AtomicOption::some(co));
-        get_scheduler().add_timer(self.timeout, wait_co.clone());
-        self.queue.timeout_wait.store(wait_co.clone());
-        cancel.set_co(wait_co);
+        // Register for cancellation while nothing else can resume the
+        // coroutine: afterwards its cancel data may be gone.
+        cancel.set_co(wait_co.clone());
         if cancel.is_canceled() {
             unsafe { cancel.cancel() };
+            return;
         }
+        self.queue.timeout_wait.store(wait_co.clone());
+        // Arm the timer last: a short timeout can fire at once.
+        get_scheduler().add_timer(self.timeout, wait_co);
     }
 }
 
@@ -271,7 +275,7 @@ impl<T> InnerQueue<T> {
         // 1. Stores the coroutine as a Blocker in wait_co (for send() to take)
         // 2. Registers a scheduler timer that fires after `timeout`
         let source = RecvTimeoutSource {
-            queue: &**self,
+            queue: self.clone(),
             timeout,
         };
         yield_with(&source);
