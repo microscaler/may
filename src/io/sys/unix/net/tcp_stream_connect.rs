@@ -92,6 +92,14 @@ impl TcpStreamConnect {
             // clear the io_flag
             self.io_data.io_flag.store(0, Ordering::Relaxed);
 
+            // An asynchronous connect that failed leaves its error in SO_ERROR. Linux also reports
+            // it from the connect() below; macOS does not (that connect succeeds or says
+            // EISCONN), so a refused connect came back as a connected stream whose first write
+            // failed with EPIPE (BrokenPipe). SO_ERROR first, on every platform.
+            if let Some(e) = self.stream.take_error()? {
+                return Err(e);
+            }
+
             match self.stream.connect(&self.addr.into()) {
                 Ok(_) => return Ok(convert_to_stream(self)),
                 Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
