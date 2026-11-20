@@ -1,5 +1,6 @@
 use std::io;
 use std::os::windows::io::{AsRawSocket, RawSocket};
+use std::sync::Arc;
 #[cfg(feature = "io_timeout")]
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Networking::WinSock::MSG_PEEK;
 
 pub struct SocketPeek<'a> {
-    io_data: EventData,
+    io_data: Arc<EventData>,
     buf: &'a mut [u8],
     socket: RawSocket,
     #[cfg(feature = "io_timeout")]
@@ -33,7 +34,7 @@ impl<'a> SocketPeek<'a> {
     ) -> Self {
         let socket = s.as_raw_socket();
         SocketPeek {
-            io_data: EventData::new(socket as HANDLE),
+            io_data: Arc::new(EventData::new(socket as HANDLE)),
             buf,
             socket,
             #[cfg(feature = "io_timeout")]
@@ -54,16 +55,15 @@ impl EventSource for SocketPeek<'_> {
         #[cfg(feature = "io_cancel")]
         let cancel = co_cancel_data(&co);
         let _g = self.can_drop.delay_drop();
-        // if the event happened before this there would be something wrong
-        // that the timer handle can't be removed in time
-        // we must prepare the timer before call the API
+        // prepare the timer before the API: if it fires while the request is
+        // still being submitted it is completed by `cancel_if_timed_out`
         #[cfg(feature = "io_timeout")]
         if let Some(dur) = self.timeout {
-            s.get_selector().add_io_timer(&mut self.io_data, dur);
+            s.get_selector().add_io_timer(&self.io_data, dur);
         }
 
         // prepare the co first
-        self.io_data.co = Some(co);
+        self.io_data.co.store(co);
 
         // call the overlapped read API
         co_try!(s, self.io_data.co.take().expect("can't get co"), unsafe {
@@ -75,13 +75,19 @@ impl EventSource for SocketPeek<'_> {
             )
         });
 
+        // a timer that fired while the request was being submitted could not
+        // cancel it yet, finish the cancellation now that it is pending; the
+        // `can_drop` guard keeps this frame alive until `subscribe` returns
+        #[cfg(feature = "io_timeout")]
+        self.io_data.cancel_if_timed_out();
+
         #[cfg(feature = "io_cancel")]
         {
             // register the cancel io data
             cancel.set_io(CancelIoData::new(&self.io_data));
             // re-check the cancel status
             if cancel.is_canceled() {
-                unsafe { cancel.cancel() };
+                cancel.cancel();
             }
         }
     }

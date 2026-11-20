@@ -1,32 +1,43 @@
-//! provide single consumer single producer channel
+//! Single-producer, single-consumer channels for threads and coroutines.
+//!
+//! Unlike [`super::mpsc`], the [`Sender`] is not cloneable: there is exactly
+//! one producer and one consumer, and each half is `Send` but not `Sync`. The
+//! channel is unbounded, so `send` never blocks. The two halves can be mixed
+//! freely — a coroutine consumer yields the worker thread while waiting, a
+//! native thread parks.
+//!
+//! Disconnect and timeout semantics follow `std::sync::mpsc`: values already
+//! queued are delivered before `try_recv`/`recv` report `Disconnected`, and
+//! `recv_timeout` returns `Timeout` only when no value became available by the
+//! deadline.
+//!
+//! Apart from the single-producer restriction (`Sender` is neither `Clone`
+//! nor `Sync`), the public surface mirrors [`super::mpsc`]: the same methods,
+//! re-exported error types, iterator traits, `Debug` output and unwind-safety
+//! bounds.
+use std::cell::Cell;
 use std::fmt;
 use std::io::ErrorKind;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{RecvError as StdRecvError, SendError, TryRecvError};
+// Re-exported so the error types are reachable through this module's path,
+// matching `super::mpsc` (and `std::sync::mpsc`).
+pub use std::sync::mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::Thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::AtomicOption;
-use crate::coroutine_impl::{
-    co_cancel_data, is_coroutine, run_coroutine, CoroutineImpl, EventSource,
-};
+use super::delay_drop::{self, DelayDrop};
+use super::{AtomicOption, WaitCo};
+use crate::coroutine_impl::{co_cancel_data, is_coroutine, CoroutineImpl, EventSource};
 use crate::likely::{likely, unlikely};
 use crate::scheduler::get_scheduler;
-use crate::yield_now::{get_co_para, yield_now, yield_with};
+use crate::timeout_list::TimeoutHandle;
+use crate::yield_now::{get_co_para, yield_with};
 
 use may_queue::spsc::Queue;
-
-/// Error returned from `Receiver::recv_with_timeout`.
-#[derive(Debug, PartialEq, Eq)]
-pub enum RecvError {
-    /// The channel disconnected (all senders dropped).
-    Disconnected,
-    /// The timeout expired before data was available.
-    Timeout,
-}
 
 /// EventSource for `recv_timeout`. It holds its own reference to the queue:
 /// once the coroutine is reachable by `send()` or the timer it may resume,
@@ -34,88 +45,186 @@ pub enum RecvError {
 struct RecvTimeoutSource<T> {
     queue: Arc<InnerQueue<T>>,
     timeout: Duration,
+    // the wait source lives on the coroutine stack; `Drop` waits until
+    // `subscribe` has finished before tearing it down
+    can_drop: DelayDrop,
+    // the scheduler timer, removed if the wait ends before its deadline
+    timer: AtomicOption<TimeoutHandle<WaitCo>>,
+}
+
+impl<T> RecvTimeoutSource<T> {
+    fn new(queue: Arc<InnerQueue<T>>, timeout: Duration) -> Self {
+        RecvTimeoutSource {
+            queue,
+            timeout,
+            can_drop: DelayDrop::new(),
+            timer: AtomicOption::none(),
+        }
+    }
+
+    fn delay_drop(&self) -> delay_drop::DropGuard<'_> {
+        self.can_drop.delay_drop()
+    }
+
+    fn set_timer(&self, handle: Option<TimeoutHandle<WaitCo>>) -> Option<TimeoutHandle<WaitCo>> {
+        match handle {
+            Some(h) => self.timer.swap(h),
+            None => self.timer.take(),
+        }
+    }
+
+    // remove the timer if it has not fired yet
+    fn remove_timer(&self) {
+        if let Some(h) = self.set_timer(None) {
+            if h.is_link() {
+                get_scheduler().del_timer(h);
+            }
+        }
+    }
+}
+
+impl<T> Drop for RecvTimeoutSource<T> {
+    fn drop(&mut self) {
+        // A concurrent wake may have resumed the coroutine while `subscribe`
+        // was still running; wait for it before touching the source.
+        self.can_drop.wait();
+        // A cancellation may have taken the coroutine without removing the
+        // registration; drop whatever is left (a no-op on the normal path).
+        self.queue.timeout_wait.clear();
+        self.remove_timer();
+    }
 }
 
 impl<T> EventSource for RecvTimeoutSource<T> {
     fn subscribe(&mut self, co: CoroutineImpl) {
+        let _g = self.delay_drop();
+
         let cancel = co_cancel_data(&co);
         // Shared between the scheduler timer and `send()` wakeup (see `timeout_wait`).
         let wait_co = Arc::new(AtomicOption::some(co));
         // Register for cancellation while nothing else can resume the
-        // coroutine: afterwards its cancel data may be gone.
+        // coroutine: once `timeout_wait` is stored, its local data may be
+        // released. Do not touch `cancel` after that point.
         cancel.set_co(wait_co.clone());
         if cancel.is_canceled() {
-            unsafe { cancel.cancel() };
+            cancel.cancel();
             return;
         }
         self.queue.timeout_wait.store(wait_co.clone());
+
+        // Re-check after registering. The store above is a SeqCst RMW that
+        // pairs with `send`/`drop_chan`'s take: if the take happened first we
+        // observe the queued value / the disconnect here instead of sleeping
+        // until the timer fires.
+        if !self.queue.queue.is_empty() || self.queue.channels.load(Ordering::Acquire) == 0 {
+            if let Some(co) = wait_co.take() {
+                get_scheduler().schedule(co);
+            }
+            return;
+        }
+
         // Arm the timer last: a short timeout can fire at once.
-        get_scheduler().add_timer(self.timeout, wait_co);
+        let handle = get_scheduler().add_timer(self.timeout, wait_co);
+        self.set_timer(Some(handle));
     }
 }
 
 struct Park<'a, T> {
     queue: &'a InnerQueue<T>,
-    // a flag if kernel is entered
-    wait_kernel: AtomicBool,
+    can_drop: DelayDrop,
 }
 
 impl<'a, T> Park<'a, T> {
     fn new(queue: &'a InnerQueue<T>) -> Park<'a, T> {
         Park {
             queue,
-            wait_kernel: AtomicBool::new(true),
+            can_drop: DelayDrop::new(),
         }
     }
 
-    fn delay_drop(&self) -> DropGuard<'_, '_, T> {
-        DropGuard(self)
+    fn delay_drop(&self) -> delay_drop::DropGuard<'_> {
+        self.can_drop.delay_drop()
     }
 }
 
 impl<T> Drop for Park<'_, T> {
     fn drop(&mut self) {
         // wait the kernel finish
-        while self.wait_kernel.load(Ordering::Relaxed) {
-            yield_now();
-        }
-    }
-}
-
-pub struct DropGuard<'a, 'b, T>(&'b Park<'a, T>);
-
-impl<T> Drop for DropGuard<'_, '_, T> {
-    fn drop(&mut self) {
-        self.0.wait_kernel.store(false, Ordering::Relaxed);
+        self.can_drop.wait();
+        // A cancellation may have taken the coroutine without removing the
+        // registration; drop whatever is left (a no-op on the normal path).
+        self.queue.wait_co.clear();
     }
 }
 
 impl<T> EventSource for Park<'_, T> {
     // register the coroutine to the park
     fn subscribe(&mut self, co: CoroutineImpl) {
+        let cancel = co_cancel_data(&co);
         // the queue could dropped if unpark by other thread
         let _g = self.delay_drop();
-        // register the coroutine
-        let wait_co = &self.queue.wait_co;
-        wait_co.store(Blocker::new_coroutine(co));
-        // re-check the state, only clear once after resume
-        if !self.queue.queue.is_empty() {
-            if let Some(co) = wait_co.take() {
-                run_coroutine(co.into_coroutine());
+
+        // The handle is shared with the cancel machinery, so exactly one of
+        // send/drop/cancel takes the coroutine out of it.
+        let wait_co = Arc::new(AtomicOption::some(co));
+        let slot = &self.queue.wait_co;
+        slot.store(Blocker::new_coroutine(wait_co.clone()));
+
+        // re-check both queued data and disconnection, only clear once after
+        // resume
+        if !self.queue.queue.is_empty() || self.queue.channels.load(Ordering::Acquire) == 0 {
+            if let Some(w) = slot.take() {
+                if let Some(co) = w.into_coroutine() {
+                    // Do not resume the coroutine inline here: it can return
+                    // from `recv`, drop this stack-resident `Park` and wait on
+                    // this very `DelayDrop` while `subscribe` is still using
+                    // it. That wait yields the coroutine, and a cancelled
+                    // coroutine cannot yield, so an inline resume deadlocks
+                    // the worker. Let the scheduler pick it up instead; the
+                    // wake semantics are the same as `send`'s unpark.
+                    get_scheduler().schedule(co);
+                }
             }
-            // return;
+            return;
+        }
+
+        // Register cancellation last, once the waiter is visible. The
+        // delay-drop guard keeps the coroutine's local data (including its
+        // `Cancel`) alive until subscribe returns, so `cancel` stays valid
+        // even if a concurrent send resumes the coroutine right now.
+        cancel.set_co(wait_co);
+        if cancel.is_canceled() {
+            cancel.cancel();
+            // the coroutine was scheduled by cancel(); drop the stale waiter
+            let _ = slot.take();
         }
     }
 }
 
+// The tagged handles below rely on the low bit being free. Both the
+// coroutine slot (an `Arc` allocation) and `Box<Thread>` are pointer-aligned.
+const _: () = assert!(std::mem::align_of::<AtomicOption<CoroutineImpl>>() >= 2);
+const _: () = assert!(std::mem::align_of::<Thread>() >= 2);
+// The handle is stored verbatim in the slot, so `AtomicOption<Blocker>` must
+// use the inline `AtomicCell` path: the boxed fallback would store a pointer
+// instead of the handle.
+const _: () = assert!(AtomicOption::<Blocker>::DIRECT_ATOMIC);
+
+/// A registered waiter: either a coroutine or a native thread, stored as a
+/// tagged pointer so `AtomicOption<Blocker>` stays lock-free.
+///
+/// The coroutine case points to a shared [`WaitCo`]
+/// (the same handle is registered with the cancel machinery). `send`,
+/// `drop_chan` and `Cancel::cancel` all race to `take()` the coroutine out of
+/// that slot, so exactly one of them resumes it.
 struct Blocker {
     handle: NonZeroUsize,
 }
 
 impl Blocker {
     #[inline]
-    fn new_coroutine(co: CoroutineImpl) -> Self {
-        let handle = NonZeroUsize::new(co.into_raw() as usize).unwrap();
+    fn new_coroutine(wait_co: WaitCo) -> Self {
+        let handle = NonZeroUsize::new(Arc::into_raw(wait_co) as usize).unwrap();
         Blocker { handle }
     }
 
@@ -127,10 +236,11 @@ impl Blocker {
     }
 
     #[inline]
-    fn into_coroutine(self) -> CoroutineImpl {
-        let co = unsafe { CoroutineImpl::from_raw(self.handle.get() as *mut _) };
+    fn into_coroutine(self) -> Option<CoroutineImpl> {
+        // safety: the handle was produced by `Arc::into_raw` above
+        let arc = unsafe { Arc::from_raw(self.handle.get() as *const AtomicOption<CoroutineImpl>) };
         std::mem::forget(self);
-        co
+        arc.take()
     }
 
     #[inline]
@@ -143,8 +253,9 @@ impl Blocker {
     #[inline]
     fn unpark(self) {
         if (self.handle.get() & 1) == 0 {
-            let co = self.into_coroutine();
-            get_scheduler().schedule(co);
+            if let Some(co) = self.into_coroutine() {
+                get_scheduler().schedule(co);
+            }
         } else {
             let thread = self.into_thread();
             thread.unpark();
@@ -155,8 +266,13 @@ impl Blocker {
 impl Drop for Blocker {
     fn drop(&mut self) {
         if (self.handle.get() & 1) == 0 {
-            // let co = self.into_coroutine();
-            unreachable!()
+            // release the shared handle; the coroutine may already have been
+            // taken by send/drop/cancel
+            unsafe {
+                drop(Arc::from_raw(
+                    self.handle.get() as *const AtomicOption<CoroutineImpl>
+                ))
+            };
         } else {
             let _thread: Box<Thread> = unsafe { Box::from_raw((self.handle.get() & !1) as *mut _) };
         }
@@ -170,8 +286,8 @@ struct InnerQueue<T> {
     queue: Queue<T>,
     // thread/coroutine for wake up, must use differently address for each round
     wait_co: AtomicOption<Blocker>,
-    /// Coroutine waiting on `recv_with_timeout` (timer + send share this Arc).
-    timeout_wait: AtomicOption<Arc<AtomicOption<CoroutineImpl>>>,
+    /// Coroutine waiting on `recv_timeout` (timer + send share this Arc).
+    timeout_wait: AtomicOption<WaitCo>,
     // The number of tx channels which are currently using this queue.
     channels: AtomicUsize,
     // if rx is dropped
@@ -190,7 +306,7 @@ impl<T> InnerQueue<T> {
     }
 
     pub fn send(&self, t: T) -> Result<(), T> {
-        if unlikely(self.port_dropped.load(Ordering::Relaxed)) {
+        if unlikely(self.port_dropped.load(Ordering::Acquire)) {
             return Err(t);
         }
         self.queue.push(t);
@@ -261,23 +377,23 @@ impl<T> InnerQueue<T> {
     /// Receive a value with a timeout.
     ///
     /// Returns `Ok(T)` if data arrives before `timeout`.
-    /// Returns `Err(RecvError::Timeout)` if the timeout expires.
-    /// Returns `Err(RecvError::Disconnected)` if the channel is disconnected.
-    fn recv_with_timeout_co(self: &Arc<Self>, timeout: Duration) -> Result<T, RecvError> {
+    /// Returns `Err(RecvTimeoutError::Timeout)` if the timeout expires.
+    /// Returns `Err(RecvTimeoutError::Disconnected)` if the channel is disconnected.
+    fn recv_timeout_co(self: &Arc<Self>, timeout: Duration) -> Result<T, RecvTimeoutError> {
         // Quick check: if data is already available, return immediately.
         match self.try_recv() {
             Ok(t) => return Ok(t),
-            Err(TryRecvError::Disconnected) => return Err(RecvError::Disconnected),
+            Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
             Err(TryRecvError::Empty) => {}
         }
 
         // Create an EventSource that:
-        // 1. Stores the coroutine as a Blocker in wait_co (for send() to take)
+        // 1. Stores the coroutine in `timeout_wait` (for send()/drop_chan())
         // 2. Registers a scheduler timer that fires after `timeout`
-        let source = RecvTimeoutSource {
-            queue: self.clone(),
-            timeout,
-        };
+        //
+        // The source removes the timer from the wheel on drop, so a wait that
+        // ends before its deadline does not leave an armed timer behind.
+        let source = RecvTimeoutSource::new(self.clone(), timeout);
         yield_with(&source);
         self.timeout_wait.clear();
 
@@ -292,12 +408,12 @@ impl<T> InnerQueue<T> {
                 // Queue is empty. The timer fired. Check co_para to confirm.
                 if let Some(err) = get_co_para() {
                     if err.kind() == ErrorKind::TimedOut {
-                        return Err(RecvError::Timeout);
+                        return Err(RecvTimeoutError::Timeout);
                     }
                 }
-                Err(RecvError::Disconnected)
+                Err(RecvTimeoutError::Disconnected)
             }
-            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected),
+            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
         }
     }
 
@@ -306,7 +422,7 @@ impl<T> InnerQueue<T> {
         match self.queue.pop() {
             Some(data) => Ok(data),
             None => {
-                if likely(self.channels.load(Ordering::Relaxed) > 0) {
+                if likely(self.channels.load(Ordering::Acquire) > 0) {
                     Err(TryRecvError::Empty)
                 } else {
                     // there is no sender any more, should re-check
@@ -317,7 +433,7 @@ impl<T> InnerQueue<T> {
     }
 
     fn drop_chan(&self) {
-        self.channels.store(0, Ordering::Relaxed);
+        self.channels.store(0, Ordering::Release);
         if let Some(co) = self.wait_co.take() {
             co.unpark();
         }
@@ -329,40 +445,77 @@ impl<T> InnerQueue<T> {
     }
 
     pub fn drop_port(&self) {
-        self.port_dropped.store(true, Ordering::Relaxed);
+        self.port_dropped.store(true, Ordering::Release);
         // clear all the data
         while self.queue.pop().is_some() {}
     }
 }
 
+/// The receiving half of an SPSC channel created by [`channel`].
+///
+/// A `Receiver` is [`Send`] but **not** [`Sync`]: it is the single consumer
+/// and cannot be shared. It can be moved between threads or used from a
+/// coroutine.
+///
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<may::sync::spsc::Receiver<i32>>();
+/// ```
 pub struct Receiver<T> {
     inner: Arc<InnerQueue<T>>,
+    // `Cell<()>` is `Send` but `!Sync`, which keeps `Receiver` `!Sync` (the
+    // queue's `pop` uses unsynchronized consumer-side access). Zero-sized.
+    _marker: PhantomData<Cell<()>>,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
-// impl<T> !Sync for Receiver<T> {}
+// Values are owned by the queue and only moved out; matching `mpsc`.
+impl<T> UnwindSafe for Receiver<T> {}
+impl<T> RefUnwindSafe for Receiver<T> {}
 
+/// An iterator over the values of a [`Receiver`], blocking until the channel
+/// disconnects.
+#[derive(Debug)]
 pub struct Iter<'a, T: 'a> {
     rx: &'a Receiver<T>,
 }
 
+/// A non-blocking iterator over the currently buffered values of a
+/// [`Receiver`].
+#[derive(Debug)]
 pub struct TryIter<'a, T: 'a> {
     rx: &'a Receiver<T>,
 }
 
+/// An owning iterator over the values of a [`Receiver`].
+#[derive(Debug)]
 pub struct IntoIter<T> {
     rx: Receiver<T>,
 }
 
+/// The sending half of an SPSC channel created by [`channel`].
+///
+/// A `Sender` is not cloneable and is **not** [`Sync`]: it is the single
+/// producer, unlike [`super::mpsc::Sender`]. It can be moved between threads
+/// or used from a coroutine.
+///
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<may::sync::spsc::Sender<i32>>();
+/// ```
 pub struct Sender<T> {
     inner: Arc<InnerQueue<T>>,
+    // `Cell<()>` is `Send` but `!Sync`, which keeps `Sender` `!Sync` (the
+    // queue's `push` uses unsynchronized producer-side access). Zero-sized.
+    _marker: PhantomData<Cell<()>>,
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
-// impl<T> !Sync for Sender<T> {}
-impl<T: Send> UnwindSafe for Sender<T> {}
-impl<T: Send> RefUnwindSafe for Sender<T> {}
+// Values are owned by the queue and only moved out; matching `mpsc`.
+impl<T> UnwindSafe for Sender<T> {}
+impl<T> RefUnwindSafe for Sender<T> {}
 
+/// Create an unbounded single-producer, single-consumer channel.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let a = Arc::new(InnerQueue::new());
     (Sender::new(a.clone()), Receiver::new(a))
@@ -374,9 +527,16 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 
 impl<T> Sender<T> {
     fn new(inner: Arc<InnerQueue<T>>) -> Sender<T> {
-        Sender { inner }
+        Sender {
+            inner,
+            _marker: PhantomData,
+        }
     }
 
+    /// Send a value on the channel, returning it back on error.
+    ///
+    /// Returns `Err` if the receiver has been dropped. Sending never blocks:
+    /// the channel is unbounded.
     pub fn send(&self, t: T) -> Result<(), SendError<T>> {
         self.inner.send(t).map_err(SendError)
     }
@@ -400,85 +560,98 @@ impl<T> fmt::Debug for Sender<T> {
 
 impl<T> Receiver<T> {
     fn new(inner: Arc<InnerQueue<T>>) -> Receiver<T> {
-        Receiver { inner }
+        Receiver {
+            inner,
+            _marker: PhantomData,
+        }
     }
 
+    /// Attempt to receive a value without blocking.
+    ///
+    /// Returns [`TryRecvError::Empty`] if no value is buffered and the sender
+    /// is alive, and [`TryRecvError::Disconnected`] if the sender has been
+    /// dropped and the buffer is empty.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.inner.try_recv()
     }
 
-    pub fn recv(&self) -> Result<T, StdRecvError> {
+    /// Block until a value is available or the channel is disconnected.
+    ///
+    /// # Panics
+    ///
+    /// In a coroutine context, panics if the coroutine is canceled while
+    /// waiting.
+    pub fn recv(&self) -> Result<T, RecvError> {
         loop {
             match self.inner.recv() {
                 Err(TryRecvError::Empty) => {}
-                data => return data.map_err(|_| StdRecvError),
+                data => return data.map_err(|_| RecvError),
             }
         }
     }
 
     /// Receive a value with a timeout.
     ///
-    /// Returns `Ok(T)` if data arrives before `timeout`.
-    /// Returns `Err(RecvError::Timeout)` if the timeout expires with an empty
-    /// queue.
-    /// Returns `Err(RecvError::Disconnected)` if the channel is disconnected.
+    /// Returns `Ok(T)` if data arrives before `timeout`,
+    /// `Err(RecvTimeoutError::Timeout)` if the deadline passes first, and
+    /// `Err(RecvTimeoutError::Disconnected)` if the sender has been dropped
+    /// and no value is buffered.
     ///
-    /// In coroutine context, uses may's scheduler timer list for cancellation.
-    /// In thread context, uses `std::thread::park_timeout`.
-    /// Receive a value, waiting at most `timeout`: the same API as the `mpsc`
-    /// and `mpmc` receivers' `recv_timeout`, with std's `RecvTimeoutError`.
-    /// Delegates to [`Receiver::recv_with_timeout`].
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
-        self.recv_with_timeout(timeout).map_err(|e| match e {
-            RecvError::Timeout => std::sync::mpsc::RecvTimeoutError::Timeout,
-            RecvError::Disconnected => std::sync::mpsc::RecvTimeoutError::Disconnected,
-        })
-    }
-
-    pub fn recv_with_timeout(&self, timeout: Duration) -> Result<T, RecvError> {
+    /// In a coroutine the wait is driven by may's scheduler timer (and is
+    /// cancellable); on a native thread it uses `std::thread::park_timeout`.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         match self.inner.try_recv() {
             Ok(t) => Ok(t),
             Err(TryRecvError::Empty) => {
                 if is_coroutine() {
-                    self.inner.recv_with_timeout_co(timeout)
+                    self.inner.recv_timeout_co(timeout)
                 } else {
-                    self.recv_with_timeout_thread(timeout)
+                    self.recv_timeout_thread(timeout)
                 }
             }
-            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected),
+            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
         }
     }
 
-    fn recv_with_timeout_thread(&self, timeout: Duration) -> Result<T, RecvError> {
-        // Store the blocker first, then try_recv to handle race condition.
-        // If data arrives between try_recv and park, send() will take the
-        // blocker and unpark us.
-        let blocker = Blocker::new_thread(std::thread::current());
-        self.inner.wait_co.store(blocker);
-        match self.inner.try_recv() {
-            Err(TryRecvError::Empty) => {
-                // no data, wait for it with timeout
-                std::thread::park_timeout(timeout);
+    fn recv_timeout_thread(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        let start = Instant::now();
+        loop {
+            let blocker = Blocker::new_thread(std::thread::current());
+            self.inner.wait_co.store(blocker);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            match self.inner.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                data => {
+                    self.inner.wait_co.clear();
+                    return data.map_err(|_| RecvTimeoutError::Disconnected);
+                }
             }
-            data => {
+
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
                 self.inner.wait_co.clear();
-                return data.map_err(|_| RecvError::Disconnected);
+                return match self.inner.try_recv() {
+                    Ok(t) => Ok(t),
+                    Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+                    Err(TryRecvError::Empty) => Err(RecvTimeoutError::Timeout),
+                };
             }
-        }
 
-        // After waking (from data or timeout), try to receive again.
-        // Data might have arrived while we were parked.
-        match self.inner.try_recv() {
-            Ok(t) => Ok(t),
-            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected),
-            Err(TryRecvError::Empty) => Err(RecvError::Timeout),
+            // As in recv(), bound each park to recover from a lost wakeup.
+            // An unpark token or spurious wakeup does not end the timeout.
+            std::thread::park_timeout(remaining.min(Duration::from_millis(10)));
+            self.inner.wait_co.clear();
         }
     }
 
+    /// Return an iterator that blocks for each value until the channel
+    /// disconnects.
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { rx: self }
     }
 
+    /// Return an iterator that never blocks, stopping as soon as the channel
+    /// is empty (or disconnected).
     pub fn try_iter(&self) -> TryIter<'_, T> {
         TryIter { rx: self }
     }
@@ -551,16 +724,42 @@ mod tests {
         }
     }
 
+    /// Compile-time checks for the parts of the public surface that mirror
+    /// `super::mpsc`.
+    #[test]
+    fn std_api_surface() {
+        // the error types are reachable through this module's path
+        use crate::sync::spsc::{
+            RecvError, RecvTimeoutError, SendError, TryRecvError, TrySendError,
+        };
+        let _: Option<RecvError> = None;
+        let _: Option<RecvTimeoutError> = None;
+        let _: Option<SendError<()>> = None;
+        let _: Option<TryRecvError> = None;
+        let _: Option<TrySendError<()>> = None;
+
+        // all three iterators implement Debug in mpsc/std
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<Iter<'static, i32>>();
+        assert_debug::<TryIter<'static, i32>>();
+        assert_debug::<IntoIter<i32>>();
+
+        // both halves are unwind-safe regardless of T, like mpsc
+        fn assert_unwind<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_unwind::<Sender<*mut ()>>();
+        assert_unwind::<Receiver<*mut ()>>();
+    }
+
     // -----------------------------------------------------------------------
-    // recv_with_timeout tests — coroutine path (run inside go! block)
+    // recv_timeout tests — coroutine path (run inside go! block)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn recv_with_timeout_immediate_data() {
+    fn recv_timeout_immediate_data() {
         let (result,) = go!(move || {
             let (tx, rx) = channel::<i32>();
             tx.send(42).unwrap();
-            let result = rx.recv_with_timeout(Duration::from_secs(5));
+            let result = rx.recv_timeout(Duration::from_secs(5));
             (result,)
         })
         .join()
@@ -569,23 +768,26 @@ mod tests {
     }
 
     #[test]
-    fn recv_with_timeout_timer_wins() {
+    fn recv_timeout_timer_wins() {
         let (result, elapsed) = go!(move || {
             let (_tx, rx) = channel::<i32>();
             let start = Instant::now();
-            let result = rx.recv_with_timeout(Duration::from_millis(50));
+            let result = rx.recv_timeout(Duration::from_millis(50));
             let elapsed = start.elapsed();
             (result, elapsed)
         })
         .join()
         .unwrap();
-        assert_eq!(result, Err(RecvError::Timeout));
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
         assert!(elapsed >= Duration::from_millis(40));
-        assert!(elapsed < Duration::from_millis(200));
+        // Wakeup latency on shared CI runners can spike to hundreds of
+        // milliseconds (observed on macOS), so the upper bound is only a
+        // sanity check that the call returned at all.
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
-    fn recv_with_timeout_data_before_timeout() {
+    fn recv_timeout_data_before_timeout() {
         let (result, elapsed) = go!(move || {
             let (tx, rx) = channel::<i32>();
             // Spawn a helper coroutine to send after 50ms
@@ -594,66 +796,69 @@ mod tests {
                 tx.send(99).unwrap();
             });
             let start = Instant::now();
-            let result = rx.recv_with_timeout(Duration::from_secs(5));
+            let result = rx.recv_timeout(Duration::from_secs(5));
             let elapsed = start.elapsed();
             (result, elapsed)
         })
         .join()
         .unwrap();
         assert_eq!(result, Ok(99));
-        assert!(elapsed < Duration::from_millis(200));
+        // Wakeup latency on shared CI runners can spike to hundreds of
+        // milliseconds (observed on macOS), so the upper bound is only a
+        // sanity check that the call returned at all.
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
-    fn recv_with_timeout_disconnect() {
+    fn recv_timeout_disconnect() {
         let result = go!(move || {
             let (tx, rx) = channel::<i32>();
             drop(tx);
-            let result = rx.recv_with_timeout(Duration::from_secs(5));
-            result
+            rx.recv_timeout(Duration::from_secs(5))
         })
         .join()
         .unwrap();
-        assert_eq!(result, Err(RecvError::Disconnected));
+        assert_eq!(result, Err(RecvTimeoutError::Disconnected));
     }
 
     #[test]
-    fn recv_with_timeout_short_timeout() {
+    fn recv_timeout_short_timeout() {
         let (result, elapsed) = go!(move || {
             let (_tx, rx) = channel::<i32>();
             let start = Instant::now();
-            let result = rx.recv_with_timeout(Duration::from_millis(5));
+            let result = rx.recv_timeout(Duration::from_millis(5));
             let elapsed = start.elapsed();
             (result, elapsed)
         })
         .join()
         .unwrap();
-        assert_eq!(result, Err(RecvError::Timeout));
-        assert!(elapsed < Duration::from_millis(100));
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
+        // Same as above: only a sanity check against a lost wakeup.
+        assert!(elapsed < Duration::from_secs(1));
     }
 
     #[test]
-    fn recv_with_timeout_repeated() {
+    fn recv_timeout_repeated() {
         go!(move || {
             let (tx, rx) = channel::<i32>();
             // First: timeout
             assert_eq!(
-                rx.recv_with_timeout(Duration::from_millis(10)),
-                Err(RecvError::Timeout)
+                rx.recv_timeout(Duration::from_millis(10)),
+                Err(RecvTimeoutError::Timeout)
             );
             // Second: data arrives
             tx.send(1).unwrap();
-            assert_eq!(rx.recv_with_timeout(Duration::from_secs(5)), Ok(1));
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(1));
             // Third: timeout again
             assert_eq!(
-                rx.recv_with_timeout(Duration::from_millis(10)),
-                Err(RecvError::Timeout)
+                rx.recv_timeout(Duration::from_millis(10)),
+                Err(RecvTimeoutError::Timeout)
             );
         });
     }
 
     #[test]
-    fn recv_with_timeout_multiple_senders() {
+    fn recv_timeout_multiple_senders() {
         let (result, elapsed) = go!(move || {
             let (tx, rx) = channel::<i32>();
 
@@ -663,33 +868,36 @@ mod tests {
             });
 
             let start = Instant::now();
-            let result = rx.recv_with_timeout(Duration::from_secs(5));
+            let result = rx.recv_timeout(Duration::from_secs(5));
             let elapsed = start.elapsed();
             (result, elapsed)
         })
         .join()
         .unwrap();
         assert_eq!(result, Ok(7));
-        assert!(elapsed < Duration::from_millis(200));
+        // Wakeup latency on shared CI runners can spike to hundreds of
+        // milliseconds (observed on macOS), so the upper bound is only a
+        // sanity check that the call returned at all.
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
-    fn recv_with_timeout_zero_duration_empty() {
+    fn recv_timeout_zero_duration_empty() {
         let result = go!(move || {
             let (_tx, rx) = channel::<i32>();
-            rx.recv_with_timeout(Duration::ZERO)
+            rx.recv_timeout(Duration::ZERO)
         })
         .join()
         .unwrap();
-        assert_eq!(result, Err(RecvError::Timeout));
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
     }
 
     #[test]
-    fn recv_with_timeout_zero_duration_with_data() {
+    fn recv_timeout_zero_duration_with_data() {
         let result = go!(move || {
             let (tx, rx) = channel::<i32>();
             tx.send(11).unwrap();
-            rx.recv_with_timeout(Duration::ZERO)
+            rx.recv_timeout(Duration::ZERO)
         })
         .join()
         .unwrap();
@@ -697,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn recv_with_timeout_send_wins_while_waiting() {
+    fn recv_timeout_send_wins_while_waiting() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -713,7 +921,7 @@ mod tests {
 
         let result = go!(move || {
             ready.store(true, Ordering::Release);
-            rx.recv_with_timeout(Duration::from_millis(500))
+            rx.recv_timeout(Duration::from_millis(500))
         })
         .join()
         .unwrap();
@@ -722,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn recv_with_timeout_drop_sender_while_waiting() {
+    fn recv_timeout_drop_sender_while_waiting() {
         use crate::sleep::sleep;
 
         let result = go!(move || {
@@ -731,48 +939,103 @@ mod tests {
                 sleep(Duration::from_millis(20));
                 drop(tx);
             });
-            rx.recv_with_timeout(Duration::from_secs(5))
+            rx.recv_timeout(Duration::from_secs(5))
         })
         .join()
         .unwrap();
-        assert_eq!(result, Err(RecvError::Disconnected));
+        assert_eq!(result, Err(RecvTimeoutError::Disconnected));
     }
 
     #[test]
-    fn recv_with_timeout_canceled_while_waiting() {
+    fn recv_timeout_canceled_while_waiting() {
         use crate::sleep::sleep;
 
         let (_tx, rx) = channel::<i32>();
-        let handle = go!(move || rx.recv_with_timeout(Duration::from_secs(5)));
+        let handle = go!(move || rx.recv_timeout(Duration::from_secs(5)));
         sleep(Duration::from_millis(50));
-        unsafe {
-            handle.coroutine().cancel();
-        }
+        unsafe { handle.coroutine().cancel() };
         assert!(handle.join().is_err());
     }
 
+    /// A coroutine blocked in `recv()` must be woken by cancellation.
     #[test]
-    fn recv_with_timeout_late_send_after_timeout() {
+    fn recv_canceled_while_waiting() {
         use crate::sleep::sleep;
 
-        go!(move || {
-            let (tx, rx) = channel::<i32>();
-            assert_eq!(
-                rx.recv_with_timeout(Duration::from_millis(10)),
-                Err(RecvError::Timeout)
-            );
-            go!(move || {
-                sleep(Duration::from_millis(10));
-                tx.send(99).unwrap();
-            });
-            sleep(Duration::from_millis(30));
-            assert_eq!(rx.recv_with_timeout(Duration::from_secs(1)), Ok(99));
+        let (tx, rx) = channel::<i32>();
+        let h = go!(move || {
+            let _ = rx.recv();
         });
+        sleep(Duration::from_millis(50));
+        unsafe { h.coroutine().cancel() };
+
+        // bounded wait: without cancellation support join() would block
+        let start = Instant::now();
+        while !h.is_done() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            h.is_done(),
+            "cancel did not wake a coroutine blocked in recv()"
+        );
+        drop(tx);
+        assert!(h.join().is_err());
+    }
+
+    /// Cancellation delivered before the coroutine parks must not spin in the
+    /// waiter's Drop (the wait-kernel flag is only set while subscribe runs).
+    #[test]
+    fn recv_canceled_before_parking() {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let (tx, rx) = channel::<i32>();
+        let h = go!(move || {
+            while r.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            let _ = rx.recv();
+        });
+
+        unsafe { h.coroutine().cancel() };
+        running.store(false, Ordering::Release);
+
+        let start = Instant::now();
+        while !h.is_done() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(h.is_done(), "cancel before parking hung");
+        drop(tx);
+        assert!(h.join().is_err());
+    }
+
+    /// A sender dropping concurrently with `recv()` must not leave the
+    /// consumer parked: the waiter registration re-checks the disconnect
+    /// state after announcing itself.
+    #[test]
+    fn recv_disconnect_race() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        for _ in 0..200 {
+            let (tx, rx) = channel::<i32>();
+            let ready_tx = ready_tx.clone();
+            let h = go!(move || {
+                ready_tx.send(()).unwrap();
+                rx.recv()
+            });
+            ready_rx.recv().unwrap();
+            drop(tx);
+
+            let start = Instant::now();
+            while !h.is_done() && start.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(h.is_done(), "recv() did not observe the disconnect");
+            assert!(h.join().unwrap().is_err());
+        }
     }
 
     #[test]
-    fn recv_timeout_matches_the_mpsc_api() {
-        use std::sync::mpsc::RecvTimeoutError;
+    fn recv_timeout_late_send_after_timeout() {
+        use crate::sleep::sleep;
 
         go!(move || {
             let (tx, rx) = channel::<i32>();
@@ -780,39 +1043,22 @@ mod tests {
                 rx.recv_timeout(Duration::from_millis(10)),
                 Err(RecvTimeoutError::Timeout)
             );
-            tx.send(7).unwrap();
-            assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(7));
-            drop(tx);
-            assert_eq!(
-                rx.recv_timeout(Duration::from_secs(1)),
-                Err(RecvTimeoutError::Disconnected)
-            );
-        })
-        .join()
-        .unwrap();
-
-        // and on a thread
-        let (tx, rx) = channel::<i32>();
-        assert_eq!(
-            rx.recv_timeout(Duration::from_millis(10)),
-            Err(RecvTimeoutError::Timeout)
-        );
-        tx.send(8).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(8));
-        drop(tx);
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)),
-            Err(RecvTimeoutError::Disconnected)
-        );
+            go!(move || {
+                sleep(Duration::from_millis(10));
+                tx.send(99).unwrap();
+            });
+            sleep(Duration::from_millis(30));
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(99));
+        });
     }
 
     #[test]
-    fn recv_with_timeout_alternates_with_blocking_recv() {
+    fn recv_timeout_alternates_with_blocking_recv() {
         go!(move || {
             let (tx, rx) = channel::<i32>();
             assert_eq!(
-                rx.recv_with_timeout(Duration::from_millis(10)),
-                Err(RecvError::Timeout)
+                rx.recv_timeout(Duration::from_millis(10)),
+                Err(RecvTimeoutError::Timeout)
             );
             // The helper returns the sender so the join handle keeps it alive: otherwise the
             // final wait could see the drop and report Disconnected instead of Timeout.
@@ -823,15 +1069,15 @@ mod tests {
             });
             assert_eq!(rx.recv().unwrap(), 1);
             assert_eq!(
-                rx.recv_with_timeout(Duration::from_millis(10)),
-                Err(RecvError::Timeout)
+                rx.recv_timeout(Duration::from_millis(10)),
+                Err(RecvTimeoutError::Timeout)
             );
             drop(sender.join());
         });
     }
 
     #[test]
-    fn recv_with_timeout_stress_timeouts_and_sends() {
+    fn recv_timeout_stress_timeouts_and_sends() {
         use crate::sleep::sleep;
 
         let iterations = 50 * stress_factor();
@@ -839,11 +1085,11 @@ mod tests {
             let (tx, rx) = channel::<i32>();
             for i in 0..iterations {
                 assert_eq!(
-                    rx.recv_with_timeout(Duration::from_millis(1)),
-                    Err(RecvError::Timeout)
+                    rx.recv_timeout(Duration::from_millis(1)),
+                    Err(RecvTimeoutError::Timeout)
                 );
                 tx.send(i as i32).unwrap();
-                assert_eq!(rx.recv_with_timeout(Duration::from_secs(1)), Ok(i as i32));
+                assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(i as i32));
                 if i % 10 == 0 {
                     sleep(Duration::from_millis(1));
                 }
@@ -852,85 +1098,141 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // recv_with_timeout tests — thread path
+    // recv_timeout tests — thread path
     // -----------------------------------------------------------------------
 
     #[test]
-    fn recv_with_timeout_thread_immediate_data() {
+    fn recv_timeout_thread_immediate_data() {
         let (tx, rx) = channel::<i32>();
         thread::spawn(move || {
             tx.send(42).unwrap();
         });
         thread::sleep(Duration::from_millis(10));
-        let result = rx.recv_with_timeout(Duration::from_secs(5));
+        let result = rx.recv_timeout(Duration::from_secs(5));
         assert_eq!(result, Ok(42));
     }
 
     #[test]
-    fn recv_with_timeout_thread_timer_wins() {
+    fn recv_timeout_thread_timer_wins() {
         let (_tx, rx) = channel::<i32>();
         let start = Instant::now();
-        let result = rx.recv_with_timeout(Duration::from_millis(50));
+        let result = rx.recv_timeout(Duration::from_millis(50));
         let elapsed = start.elapsed();
-        assert_eq!(result, Err(RecvError::Timeout));
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
         assert!(elapsed >= Duration::from_millis(40));
-        assert!(elapsed < Duration::from_millis(200));
+        // Wakeup latency on shared CI runners can spike to hundreds of
+        // milliseconds (observed on macOS), so the upper bound is only a
+        // sanity check that the call returned at all.
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
-    fn recv_with_timeout_thread_data_before_timeout() {
+    fn recv_timeout_thread_data_before_timeout() {
         let (tx, rx) = channel::<i32>();
         let handle = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             tx.send(99).unwrap();
         });
         let start = Instant::now();
-        let result = rx.recv_with_timeout(Duration::from_secs(5));
+        let result = rx.recv_timeout(Duration::from_secs(5));
         let elapsed = start.elapsed();
         handle.join().ok();
         assert_eq!(result, Ok(99));
-        assert!(elapsed < Duration::from_millis(200));
+        // Wakeup latency on shared CI runners can spike to hundreds of
+        // milliseconds (observed on macOS), so the upper bound is only a
+        // sanity check that the call returned at all.
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
-    fn recv_with_timeout_thread_disconnect() {
+    fn recv_timeout_thread_disconnect() {
         let (tx, rx) = channel::<i32>();
         drop(tx);
-        let result = rx.recv_with_timeout(Duration::from_secs(5));
-        assert_eq!(result, Err(RecvError::Disconnected));
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        assert_eq!(result, Err(RecvTimeoutError::Disconnected));
     }
 
     #[test]
-    fn recv_with_timeout_thread_zero_duration_empty() {
+    fn recv_timeout_thread_zero_duration_empty() {
         let (_tx, rx) = channel::<i32>();
         let start = Instant::now();
-        let result = rx.recv_with_timeout(Duration::ZERO);
+        let result = rx.recv_timeout(Duration::ZERO);
         let elapsed = start.elapsed();
-        assert_eq!(result, Err(RecvError::Timeout));
-        assert!(elapsed < Duration::from_millis(50));
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
+        // Same as above: only a sanity check against a lost wakeup.
+        assert!(elapsed < Duration::from_secs(1));
     }
 
     #[test]
-    fn recv_with_timeout_thread_zero_duration_with_data() {
+    fn recv_timeout_thread_zero_duration_with_data() {
         let (tx, rx) = channel::<i32>();
         tx.send(55).unwrap();
-        assert_eq!(rx.recv_with_timeout(Duration::ZERO), Ok(55));
+        assert_eq!(rx.recv_timeout(Duration::ZERO), Ok(55));
     }
 
     #[test]
-    fn recv_with_timeout_thread_drop_sender_while_waiting() {
+    fn recv_timeout_thread_drop_sender_while_waiting() {
         let (tx, rx) = channel::<i32>();
         let sender = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             drop(tx);
         });
-        let result = rx.recv_with_timeout(Duration::from_secs(5));
+        let result = rx.recv_timeout(Duration::from_secs(5));
         sender.join().unwrap();
-        assert_eq!(result, Err(RecvError::Disconnected));
+        assert_eq!(result, Err(RecvTimeoutError::Disconnected));
     }
 
     #[test]
-    fn recv_with_timeout_thread_send_wins_while_waiting() {
+    fn recv_timeout_thread_ignores_existing_unpark_token() {
+        thread::spawn(|| {
+            let (_tx, rx) = channel::<i32>();
+            thread::current().unpark();
+            let start = Instant::now();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            );
+            assert!(start.elapsed() >= Duration::from_millis(100));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn recv_timeout_thread_disconnect_after_early_wakeup() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = channel::<i32>();
+        let receiver = thread::spawn(move || {
+            thread::current().unpark();
+            ready_tx.send(()).unwrap();
+            rx.recv_timeout(Duration::from_secs(5))
+        });
+        ready_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        drop(tx);
+        assert_eq!(
+            receiver.join().unwrap(),
+            Err(RecvTimeoutError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn recv_timeout_thread_data_after_early_wakeup() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = channel::<i32>();
+        let receiver = thread::spawn(move || {
+            thread::current().unpark();
+            ready_tx.send(()).unwrap();
+            rx.recv_timeout(Duration::from_secs(5))
+        });
+        ready_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        tx.send(88).unwrap();
+        assert_eq!(receiver.join().unwrap(), Ok(88));
+    }
+
+    #[test]
+    fn recv_timeout_thread_send_wins_while_waiting() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -944,28 +1246,51 @@ mod tests {
             tx.send(88).unwrap();
         });
         ready.store(true, Ordering::Release);
-        let result = rx.recv_with_timeout(Duration::from_millis(500));
+        let result = rx.recv_timeout(Duration::from_millis(500));
         sender.join().unwrap();
         assert_eq!(result, Ok(88));
     }
 
     #[test]
-    fn recv_with_timeout_thread_repeated() {
+    fn recv_timeout_thread_repeated() {
         let (tx, rx) = channel::<i32>();
         assert_eq!(
-            rx.recv_with_timeout(Duration::from_millis(10)),
-            Err(RecvError::Timeout)
+            rx.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
         );
         tx.send(3).unwrap();
-        assert_eq!(rx.recv_with_timeout(Duration::from_secs(1)), Ok(3));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(3));
         assert_eq!(
-            rx.recv_with_timeout(Duration::from_millis(10)),
-            Err(RecvError::Timeout)
+            rx.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
         );
     }
 
+    #[test]
+    fn recv_timeout_thread_no_stale_blocker() {
+        let (tx, rx) = channel::<i32>();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        // A timeout must clear its registration before returning. Check the
+        // slot directly: if a blocker were left behind, the send() below
+        // would find it and unpark this thread. Timing the following park
+        // cannot prove that, because `thread::park_timeout` is allowed to
+        // wake spuriously (and `Instant` can under-report the wait when the
+        // thread is descheduled).
+        assert!(
+            rx.inner.wait_co.take().is_none(),
+            "recv_timeout left a stale blocker behind"
+        );
+        // With no waiter registered, send() only queues the value.
+        tx.send(1).unwrap();
+        assert!(rx.inner.wait_co.take().is_none());
+        assert_eq!(rx.try_recv(), Ok(1));
+    }
+
     // -----------------------------------------------------------------------
-    // Pre-existing spsc tests (from master) + recv_with_timeout tests above
+    // Existing tests (unchanged)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1311,58 +1636,58 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn oneshot_single_thread_recv_timeout() {
-    //     let (tx, rx) = channel();
-    //     tx.send(()).unwrap();
-    //     assert_eq!(rx.recv_timeout(Duration::from_millis(1)), Ok(()));
-    //     assert_eq!(
-    //         rx.recv_timeout(Duration::from_millis(1)),
-    //         Err(RecvTimeoutError::Timeout)
-    //     );
-    //     tx.send(()).unwrap();
-    //     assert_eq!(rx.recv_timeout(Duration::from_millis(1)), Ok(()));
-    // }
+    #[test]
+    fn oneshot_single_thread_recv_timeout() {
+        let (tx, rx) = channel();
+        tx.send(()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_millis(1)), Ok(()));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(1)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        tx.send(()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_millis(1)), Ok(()));
+    }
 
-    // #[test]
-    // fn stress_recv_timeout_two_threads() {
-    //     let (tx, rx) = channel();
-    //     let stress = stress_factor() + 100;
-    //     let timeout = Duration::from_millis(1);
+    #[test]
+    fn stress_recv_timeout_two_threads() {
+        let (tx, rx) = channel();
+        let stress = stress_factor() + 100;
+        let timeout = Duration::from_millis(1);
 
-    //     thread::spawn(move || {
-    //         for i in 0..stress {
-    //             if i % 2 == 0 {
-    //                 thread::sleep(timeout * 2);
-    //             }
-    //             tx.send(1usize).unwrap();
-    //         }
-    //     });
+        thread::spawn(move || {
+            for i in 0..stress {
+                if i % 2 == 0 {
+                    thread::sleep(timeout * 2);
+                }
+                tx.send(1usize).unwrap();
+            }
+        });
 
-    //     let mut recv_count = 0;
-    //     loop {
-    //         match rx.recv_timeout(timeout) {
-    //             Ok(n) => {
-    //                 assert_eq!(n, 1usize);
-    //                 recv_count += 1;
-    //             }
-    //             Err(RecvTimeoutError::Timeout) => continue,
-    //             Err(RecvTimeoutError::Disconnected) => break,
-    //         }
-    //     }
+        let mut recv_count = 0;
+        loop {
+            match rx.recv_timeout(timeout) {
+                Ok(n) => {
+                    assert_eq!(n, 1usize);
+                    recv_count += 1;
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
 
-    //     assert_eq!(recv_count, stress);
-    // }
+        assert_eq!(recv_count, stress);
+    }
 
-    // #[test]
-    // fn recv_timeout_upgrade() {
-    //     let (_tx, rx) = channel::<()>();
-    //     let timeout = Duration::from_millis(1);
+    #[test]
+    fn recv_timeout_upgrade() {
+        let (_tx, rx) = channel::<()>();
+        let timeout = Duration::from_millis(1);
 
-    //     let start = Instant::now();
-    //     assert_eq!(rx.recv_timeout(timeout), Err(RecvTimeoutError::Timeout));
-    //     assert!(Instant::now() >= start + timeout);
-    // }
+        let start = Instant::now();
+        assert_eq!(rx.recv_timeout(timeout), Err(RecvTimeoutError::Timeout));
+        assert!(Instant::now() >= start + timeout);
+    }
 
     #[test]
     fn recv_a_lot() {
@@ -1519,677 +1844,5 @@ mod tests {
 
         // wait for the child thread to exit before we exit
         rx2.recv().unwrap();
-    } /*
-      }
-
-      #[cfg(test)]
-      mod sync_tests {
-          use prelude::v1::*;
-
-          use env;
-          use thread;
-          use super::*;
-          use time::Duration;
-
-          pub fn stress_factor() -> usize {
-              match env::var("RUST_TEST_STRESS") {
-                  Ok(val) => val.parse().unwrap(),
-                  Err(..) => 1,
-              }
-          }
-
-          #[test]
-          fn smoke() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              tx.send(1).unwrap();
-              assert_eq!(rx.recv().unwrap(), 1);
-          }
-
-          #[test]
-          fn drop_full() {
-              let (tx, _rx) = sync_channel::<Box<isize>>(1);
-              tx.send(box 1).unwrap();
-          }
-
-          #[test]
-          fn smoke_shared() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              tx.send(1).unwrap();
-              assert_eq!(rx.recv().unwrap(), 1);
-              let tx = tx.clone();
-              tx.send(1).unwrap();
-              assert_eq!(rx.recv().unwrap(), 1);
-          }
-
-          #[test]
-          fn recv_timeout() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              assert_eq!(rx.recv_timeout(Duration::from_millis(1)),
-                         Err(RecvTimeoutError::Timeout));
-              tx.send(1).unwrap();
-              assert_eq!(rx.recv_timeout(Duration::from_millis(1)), Ok(1));
-          }
-
-          #[test]
-          fn smoke_threads() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let _t = thread::spawn(move || {
-                  tx.send(1).unwrap();
-              });
-              assert_eq!(rx.recv().unwrap(), 1);
-          }
-
-          #[test]
-          fn smoke_port_gone() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              drop(rx);
-              assert!(tx.send(1).is_err());
-          }
-
-          #[test]
-          fn smoke_shared_port_gone2() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              drop(rx);
-              let tx2 = tx.clone();
-              drop(tx);
-              assert!(tx2.send(1).is_err());
-          }
-
-          #[test]
-          fn port_gone_concurrent() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let _t = thread::spawn(move || {
-                  rx.recv().unwrap();
-              });
-              while tx.send(1).is_ok() {}
-          }
-
-          #[test]
-          fn port_gone_concurrent_shared() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let tx2 = tx.clone();
-              let _t = thread::spawn(move || {
-                  rx.recv().unwrap();
-              });
-              while tx.send(1).is_ok() && tx2.send(1).is_ok() {}
-          }
-
-          #[test]
-          fn smoke_chan_gone() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              drop(tx);
-              assert!(rx.recv().is_err());
-          }
-
-          #[test]
-          fn smoke_chan_gone_shared() {
-              let (tx, rx) = sync_channel::<()>(0);
-              let tx2 = tx.clone();
-              drop(tx);
-              drop(tx2);
-              assert!(rx.recv().is_err());
-          }
-
-          #[test]
-          fn chan_gone_concurrent() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              thread::spawn(move || {
-                  tx.send(1).unwrap();
-                  tx.send(1).unwrap();
-              });
-              while rx.recv().is_ok() {}
-          }
-
-          #[test]
-          fn stress() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              thread::spawn(move || {
-                  for _ in 0..10000 {
-                      tx.send(1).unwrap();
-                  }
-              });
-              for _ in 0..10000 {
-                  assert_eq!(rx.recv().unwrap(), 1);
-              }
-          }
-
-          #[test]
-          fn stress_recv_timeout_two_threads() {
-              let (tx, rx) = sync_channel::<i32>(0);
-
-              thread::spawn(move || {
-                  for _ in 0..10000 {
-                      tx.send(1).unwrap();
-                  }
-              });
-
-              let mut recv_count = 0;
-              loop {
-                  match rx.recv_timeout(Duration::from_millis(1)) {
-                      Ok(v) => {
-                          assert_eq!(v, 1);
-                          recv_count += 1;
-                      }
-                      Err(RecvTimeoutError::Timeout) => continue,
-                      Err(RecvTimeoutError::Disconnected) => break,
-                  }
-              }
-
-              assert_eq!(recv_count, 10000);
-          }
-
-          #[test]
-          fn stress_recv_timeout_shared() {
-              const AMT: u32 = 1000;
-              const NTHREADS: u32 = 8;
-              let (tx, rx) = sync_channel::<i32>(0);
-              let (dtx, drx) = sync_channel::<()>(0);
-
-              thread::spawn(move || {
-                  let mut recv_count = 0;
-                  loop {
-                      match rx.recv_timeout(Duration::from_millis(10)) {
-                          Ok(v) => {
-                              assert_eq!(v, 1);
-                              recv_count += 1;
-                          }
-                          Err(RecvTimeoutError::Timeout) => continue,
-                          Err(RecvTimeoutError::Disconnected) => break,
-                      }
-                  }
-
-                  assert_eq!(recv_count, AMT * NTHREADS);
-                  assert!(rx.try_recv().is_err());
-
-                  dtx.send(()).unwrap();
-              });
-
-              for _ in 0..NTHREADS {
-                  let tx = tx.clone();
-                  thread::spawn(move || {
-                      for _ in 0..AMT {
-                          tx.send(1).unwrap();
-                      }
-                  });
-              }
-
-              drop(tx);
-
-              drx.recv().unwrap();
-          }
-
-          #[test]
-          fn stress_shared() {
-              const AMT: u32 = 1000;
-              const NTHREADS: u32 = 8;
-              let (tx, rx) = sync_channel::<i32>(0);
-              let (dtx, drx) = sync_channel::<()>(0);
-
-              thread::spawn(move || {
-                  for _ in 0..AMT * NTHREADS {
-                      assert_eq!(rx.recv().unwrap(), 1);
-                  }
-                  match rx.try_recv() {
-                      Ok(..) => panic!(),
-                      _ => {}
-                  }
-                  dtx.send(()).unwrap();
-              });
-
-              for _ in 0..NTHREADS {
-                  let tx = tx.clone();
-                  thread::spawn(move || {
-                      for _ in 0..AMT {
-                          tx.send(1).unwrap();
-                      }
-                  });
-              }
-              drop(tx);
-              drx.recv().unwrap();
-          }
-
-          #[test]
-          fn oneshot_single_thread_close_port_first() {
-              // Simple test of closing without sending
-              let (_tx, rx) = sync_channel::<i32>(0);
-              drop(rx);
-          }
-
-          #[test]
-          fn oneshot_single_thread_close_chan_first() {
-              // Simple test of closing without sending
-              let (tx, _rx) = sync_channel::<i32>(0);
-              drop(tx);
-          }
-
-          #[test]
-          fn oneshot_single_thread_send_port_close() {
-              // Testing that the sender cleans up the payload if receiver is closed
-              let (tx, rx) = sync_channel::<Box<i32>>(0);
-              drop(rx);
-              assert!(tx.send(box 0).is_err());
-          }
-
-          #[test]
-          fn oneshot_single_thread_recv_chan_close() {
-              // Receiving on a closed chan will panic
-              let res = thread::spawn(move || {
-                      let (tx, rx) = sync_channel::<i32>(0);
-                      drop(tx);
-                      rx.recv().unwrap();
-                  })
-                  .join();
-              // What is our res?
-              assert!(res.is_err());
-          }
-
-          #[test]
-          fn oneshot_single_thread_send_then_recv() {
-              let (tx, rx) = sync_channel::<Box<i32>>(1);
-              tx.send(box 10).unwrap();
-              assert!(rx.recv().unwrap() == box 10);
-          }
-
-          #[test]
-          fn oneshot_single_thread_try_send_open() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              assert_eq!(tx.try_send(10), Ok(()));
-              assert!(rx.recv().unwrap() == 10);
-          }
-
-          // #[test]
-          // fn oneshot_single_thread_try_send_closed() {
-          //     let (tx, rx) = sync_channel::<i32>(0);
-          //     drop(rx);
-          //     assert_eq!(tx.try_send(10), Err(TrySendError::Disconnected(10)));
-          // }
-
-          // #[test]
-          // fn oneshot_single_thread_try_send_closed2() {
-          //     let (tx, _rx) = sync_channel::<i32>(0);
-          //     assert_eq!(tx.try_send(10), Err(TrySendError::Full(10)));
-          // }
-
-          #[test]
-          fn oneshot_single_thread_try_recv_open() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              tx.send(10).unwrap();
-              assert!(rx.recv() == Ok(10));
-          }
-
-          #[test]
-          fn oneshot_single_thread_try_recv_closed() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              drop(tx);
-              assert!(rx.recv().is_err());
-          }
-
-          #[test]
-          fn oneshot_single_thread_try_recv_closed_with_data() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              tx.send(10).unwrap();
-              drop(tx);
-              assert_eq!(rx.try_recv(), Ok(10));
-              assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
-          }
-
-          #[test]
-          fn oneshot_single_thread_peek_data() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
-              tx.send(10).unwrap();
-              assert_eq!(rx.try_recv(), Ok(10));
-          }
-
-          #[test]
-          fn oneshot_single_thread_peek_close() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              drop(tx);
-              assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
-              assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
-          }
-
-          #[test]
-          fn oneshot_single_thread_peek_open() {
-              let (_tx, rx) = sync_channel::<i32>(0);
-              assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
-          }
-
-          #[test]
-          fn oneshot_multi_task_recv_then_send() {
-              let (tx, rx) = sync_channel::<Box<i32>>(0);
-              let _t = thread::spawn(move || {
-                  assert!(rx.recv().unwrap() == box 10);
-              });
-
-              tx.send(box 10).unwrap();
-          }
-
-          #[test]
-          fn oneshot_multi_task_recv_then_close() {
-              let (tx, rx) = sync_channel::<Box<i32>>(0);
-              let _t = thread::spawn(move || {
-                  drop(tx);
-              });
-              let res = thread::spawn(move || {
-                      assert!(rx.recv().unwrap() == box 10);
-                  })
-                  .join();
-              assert!(res.is_err());
-          }
-
-          #[test]
-          fn oneshot_multi_thread_close_stress() {
-              for _ in 0..stress_factor() {
-                  let (tx, rx) = sync_channel::<i32>(0);
-                  let _t = thread::spawn(move || {
-                      drop(rx);
-                  });
-                  drop(tx);
-              }
-          }
-
-          #[test]
-          fn oneshot_multi_thread_send_close_stress() {
-              for _ in 0..stress_factor() {
-                  let (tx, rx) = sync_channel::<i32>(0);
-                  let _t = thread::spawn(move || {
-                      drop(rx);
-                  });
-                  let _ = thread::spawn(move || {
-                          tx.send(1).unwrap();
-                      })
-                      .join();
-              }
-          }
-
-          #[test]
-          fn oneshot_multi_thread_recv_close_stress() {
-              for _ in 0..stress_factor() {
-                  let (tx, rx) = sync_channel::<i32>(0);
-                  let _t = thread::spawn(move || {
-                      let res = thread::spawn(move || {
-                              rx.recv().unwrap();
-                          })
-                          .join();
-                      assert!(res.is_err());
-                  });
-                  let _t = thread::spawn(move || {
-                      thread::spawn(move || {
-                          drop(tx);
-                      });
-                  });
-              }
-          }
-
-          #[test]
-          fn oneshot_multi_thread_send_recv_stress() {
-              for _ in 0..stress_factor() {
-                  let (tx, rx) = sync_channel::<Box<i32>>(0);
-                  let _t = thread::spawn(move || {
-                      tx.send(box 10).unwrap();
-                  });
-                  assert!(rx.recv().unwrap() == box 10);
-              }
-          }
-
-          // #[test]
-          // fn stream_send_recv_stress() {
-          //     for _ in 0..stress_factor() {
-          //         let (tx, rx) = sync_channel::<Box<i32>>(0);
-          //
-          //         send(tx, 0);
-          //         recv(rx, 0);
-          //
-          //         fn send(tx: SyncSender<Box<i32>>, i: i32) {
-          //             if i == 10 {
-          //                 return;
-          //             }
-          //
-          //             thread::spawn(move || {
-          //                 tx.send(box i).unwrap();
-          //                 send(tx, i + 1);
-          //             });
-          //         }
-          //
-          //         fn recv(rx: Receiver<Box<i32>>, i: i32) {
-          //             if i == 10 {
-          //                 return;
-          //             }
-          //
-          //             thread::spawn(move || {
-          //                 assert!(rx.recv().unwrap() == box i);
-          //                 recv(rx, i + 1);
-          //             });
-          //         }
-          //     }
-          // }
-
-          #[test]
-          fn recv_a_lot() {
-              // Regression test that we don't run out of stack in scheduler context
-              let (tx, rx) = sync_channel(10000);
-              for _ in 0..10000 {
-                  tx.send(()).unwrap();
-              }
-              for _ in 0..10000 {
-                  rx.recv().unwrap();
-              }
-          }
-
-          #[test]
-          fn shared_chan_stress() {
-              let (tx, rx) = sync_channel(0);
-              let total = stress_factor() + 100;
-              for _ in 0..total {
-                  let tx = tx.clone();
-                  thread::spawn(move || {
-                      tx.send(()).unwrap();
-                  });
-              }
-
-              for _ in 0..total {
-                  rx.recv().unwrap();
-              }
-          }
-
-          #[test]
-          fn test_nested_recv_iter() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let (total_tx, total_rx) = sync_channel::<i32>(0);
-
-              let _t = thread::spawn(move || {
-                  let mut acc = 0;
-                  for x in rx.iter() {
-                      acc += x;
-                  }
-                  total_tx.send(acc).unwrap();
-              });
-
-              tx.send(3).unwrap();
-              tx.send(1).unwrap();
-              tx.send(2).unwrap();
-              drop(tx);
-              assert_eq!(total_rx.recv().unwrap(), 6);
-          }
-
-          #[test]
-          fn test_recv_iter_break() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let (count_tx, count_rx) = sync_channel(0);
-
-              let _t = thread::spawn(move || {
-                  let mut count = 0;
-                  for x in rx.iter() {
-                      if count >= 3 {
-                          break;
-                      } else {
-                          count += x;
-                      }
-                  }
-                  count_tx.send(count).unwrap();
-              });
-
-              tx.send(2).unwrap();
-              tx.send(2).unwrap();
-              tx.send(2).unwrap();
-              let _ = tx.try_send(2);
-              drop(tx);
-              assert_eq!(count_rx.recv().unwrap(), 4);
-          }
-
-          #[test]
-          fn try_recv_states() {
-              let (tx1, rx1) = sync_channel::<i32>(1);
-              let (tx2, rx2) = sync_channel::<()>(1);
-              let (tx3, rx3) = sync_channel::<()>(1);
-              let _t = thread::spawn(move || {
-                  rx2.recv().unwrap();
-                  tx1.send(1).unwrap();
-                  tx3.send(()).unwrap();
-                  rx2.recv().unwrap();
-                  drop(tx1);
-                  tx3.send(()).unwrap();
-              });
-
-              assert_eq!(rx1.try_recv(), Err(TryRecvError::Empty));
-              tx2.send(()).unwrap();
-              rx3.recv().unwrap();
-              assert_eq!(rx1.try_recv(), Ok(1));
-              assert_eq!(rx1.try_recv(), Err(TryRecvError::Empty));
-              tx2.send(()).unwrap();
-              rx3.recv().unwrap();
-              assert_eq!(rx1.try_recv(), Err(TryRecvError::Disconnected));
-          }
-
-          // This bug used to end up in a livelock inside of the Receiver destructor
-          // because the internal state of the Shared packet was corrupted
-          #[test]
-          fn destroy_upgraded_shared_port_when_sender_still_active() {
-              let (tx, rx) = sync_channel::<()>(0);
-              let (tx2, rx2) = sync_channel::<()>(0);
-              let _t = thread::spawn(move || {
-                  rx.recv().unwrap(); // wait on a oneshot
-                  drop(rx);  // destroy a shared
-                  tx2.send(()).unwrap();
-              });
-              // make sure the other thread has gone to sleep
-              for _ in 0..5000 {
-                  thread::yield_now();
-              }
-
-              // upgrade to a shared chan and send a message
-              let t = tx.clone();
-              drop(tx);
-              t.send(()).unwrap();
-
-              // wait for the child thread to exit before we exit
-              rx2.recv().unwrap();
-          }
-
-          #[test]
-          fn send1() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let _t = thread::spawn(move || {
-                  rx.recv().unwrap();
-              });
-              assert_eq!(tx.send(1), Ok(()));
-          }
-
-          #[test]
-          fn send2() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let _t = thread::spawn(move || {
-                  drop(rx);
-              });
-              assert!(tx.send(1).is_err());
-          }
-
-          #[test]
-          fn send3() {
-              let (tx, rx) = sync_channel::<i32>(1);
-              assert_eq!(tx.send(1), Ok(()));
-              let _t = thread::spawn(move || {
-                  drop(rx);
-              });
-              assert!(tx.send(1).is_err());
-          }
-
-          #[test]
-          fn send4() {
-              let (tx, rx) = sync_channel::<i32>(0);
-              let tx2 = tx.clone();
-              let (done, done_rx) = channel();
-              let done2 = done.clone();
-              let _t = thread::spawn(move || {
-                  assert!(tx.send(1).is_err());
-                  done.send(()).unwrap();
-              });
-              let _t = thread::spawn(move || {
-                  assert!(tx2.send(2).is_err());
-                  done2.send(()).unwrap();
-              });
-              drop(rx);
-              done_rx.recv().unwrap();
-              done_rx.recv().unwrap();
-          }
-
-          // #[test]
-          // fn try_send1() {
-          //     let (tx, _rx) = sync_channel::<i32>(0);
-          //     assert_eq!(tx.try_send(1), Err(TrySendError::Full(1)));
-          // }
-
-          // #[test]
-          // fn try_send2() {
-          //     let (tx, _rx) = sync_channel::<i32>(1);
-          //     assert_eq!(tx.try_send(1), Ok(()));
-          //     assert_eq!(tx.try_send(1), Err(TrySendError::Full(1)));
-          // }
-
-          // #[test]
-          // fn try_send3() {
-          //     let (tx, rx) = sync_channel::<i32>(1);
-          //     assert_eq!(tx.try_send(1), Ok(()));
-          //     drop(rx);
-          //     assert_eq!(tx.try_send(1), Err(TrySendError::Disconnected(1)));
-          // }
-
-          #[test]
-          fn issue_15761() {
-              fn repro() {
-                  let (tx1, rx1) = sync_channel::<()>(3);
-                  let (tx2, rx2) = sync_channel::<()>(3);
-
-                  let _t = thread::spawn(move || {
-                      rx1.recv().unwrap();
-                      tx2.try_send(()).unwrap();
-                  });
-
-                  tx1.try_send(()).unwrap();
-                  rx2.recv().unwrap();
-              }
-
-              for _ in 0..100 {
-                  repro()
-              }
-          }
-
-          #[test]
-          fn fmt_debug_sender() {
-              let (tx, _) = channel::<i32>();
-              assert_eq!(format!("{:?}", tx), "Sender { .. }");
-          }
-
-          #[test]
-          fn fmt_debug_recv() {
-              let (_, rx) = channel::<i32>();
-              assert_eq!(format!("{:?}", rx), "Receiver { .. }");
-          }
-
-          // #[test]
-          // fn fmt_debug_sync_sender() {
-          //     let (tx, _) = sync_channel::<i32>(1);
-          //     assert_eq!(format!("{:?}", tx), "SyncSender { .. }");
-          // }*/
+    }
 }

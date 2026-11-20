@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::super::{co_io_result, from_nix_error, IoData};
+#[cfg(feature = "io_cancel")]
+use crate::coroutine_impl::co_cancel_data;
 use crate::coroutine_impl::{is_coroutine, CoroutineImpl, EventSource};
 use crate::io::AsIoData;
 use crate::yield_now::yield_with_io;
@@ -63,19 +65,33 @@ impl<'a> SocketWrite<'a> {
 
 impl EventSource for SocketWrite<'_> {
     fn subscribe(&mut self, co: CoroutineImpl) {
+        #[cfg(feature = "io_cancel")]
+        let cancel = co_cancel_data(&co);
         let io_data = self.io_data;
 
-        #[cfg(feature = "io_timeout")]
-        if let Some(dur) = self.timeout {
-            crate::scheduler::get_scheduler()
-                .get_selector()
-                .add_io_timer(self.io_data, dur);
-        }
-        io_data.co.store(co);
+        // the timer holds its own clone of the wait slot, so an immediate
+        // expiry still reaches the coroutine; after publishing, only use the
+        // shared event data, the resumed coroutine may drop the io data
+        let (event_data, wait) = io_data.publish_co(
+            co,
+            #[cfg(feature = "io_timeout")]
+            self.timeout,
+        );
 
         // there is event, re-run the coroutine
-        if io_data.io_flag.load(Ordering::Acquire) != 0 {
-            io_data.fast_schedule();
+        if event_data.io_flag.load(Ordering::Acquire) != 0 {
+            #[allow(clippy::needless_return)]
+            return event_data.fast_schedule(&wait);
+        }
+
+        #[cfg(feature = "io_cancel")]
+        {
+            // register the cancel wait
+            cancel.set_io(wait);
+            // re-check the cancel status
+            if cancel.is_canceled() {
+                cancel.cancel();
+            }
         }
     }
 }

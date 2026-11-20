@@ -1,18 +1,29 @@
-//! mpmc synchronized channel implementation
+//! Multi-producer, multi-consumer channels for threads and coroutines.
 //!
-//! support an unbounded mpmc queue, senders would not block
-//! receivers would block if there is no data until sender send data
-//! it's almost the same as `mpsc` except that we support multi receivers
-//! each receiver would consume one data each time so that other receivers
-//! would not see that the same data any more
+//! Unlike [`super::mpsc`], every receiver consumes at most one value per
+//! receive, and both [`Sender`] and [`Receiver`] are `Clone` and `Sync`, so
+//! they can be shared across threads and coroutines. The channel is
+//! unbounded: `send` never blocks, while receivers block when the queue is
+//! empty.
+//!
+//! Disconnect semantics match `std::sync::mpsc`: dropping every sender
+//! disconnects the channel, and values already queued are still delivered
+//! before `try_recv`/`recv` report `Disconnected`.
+//!
+//! For coroutines, a blocking receive is a cancellation point: cancellation
+//! unwinds the coroutine with the cancel panic instead of returning an error.
 
 use std::fmt;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError};
+// Re-exported so the error types are reachable through this module's path,
+// matching the other channel modules.
+pub use std::sync::mpsc::{RecvError, RecvTimeoutError, SendError, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::Semphore;
+use super::semphore::WaitStatus;
+use super::Semaphore;
 use crossbeam::queue::SegQueue;
 
 /// /////////////////////////////////////////////////////////////////////////////
@@ -21,7 +32,7 @@ use crossbeam::queue::SegQueue;
 struct InnerQueue<T> {
     queue: SegQueue<T>,
     // thread/coroutine for wake up
-    sem: Semphore,
+    sem: Semaphore,
     // The number of tx channels which are currently using this queue.
     tx_ports: AtomicUsize,
     // if rx is dropped
@@ -32,7 +43,7 @@ impl<T> InnerQueue<T> {
     pub fn new() -> InnerQueue<T> {
         InnerQueue {
             queue: SegQueue::new(),
-            sem: Semphore::new(0),
+            sem: Semaphore::new(0),
             tx_ports: AtomicUsize::new(1),
             rx_ports: AtomicUsize::new(1),
         }
@@ -55,20 +66,47 @@ impl<T> InnerQueue<T> {
             Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
         }
 
-        match dur {
-            None => self.sem.wait(),
-            Some(t) => {
-                if !self.sem.wait_timeout(t) {
-                    return Err(RecvTimeoutError::Timeout);
-                }
+        // The disconnect re-check is done *after* the waiter is published
+        // (inside `wait_timeout_until`): a receiver that parks after the last
+        // sender's wakeup would otherwise never be woken again.
+        match self
+            .sem
+            .wait_timeout_until(dur, || self.tx_ports.load(Ordering::Acquire) == 0)
+        {
+            WaitStatus::Acquired => {}
+            WaitStatus::Stopped => {
+                // The wait ended on the disconnect. A sender may still have
+                // published its last value before dropping its port, and the
+                // disconnect wake-up is only advisory, so `Stopped` does not
+                // imply that no value is buffered. Queued values must be
+                // delivered before the disconnect is reported.
+                return match self.queue.pop() {
+                    Some(data) => Ok(data),
+                    None => Err(RecvTimeoutError::Disconnected),
+                };
             }
+            WaitStatus::Timeout => return Err(RecvTimeoutError::Timeout),
         }
 
         match self.queue.pop() {
             Some(data) => Ok(data),
             None => match self.tx_ports.load(Ordering::Acquire) {
-                0 => Err(RecvTimeoutError::Disconnected),
-                _n => unreachable!("mpmc recv found no data"),
+                // a disconnect wakeup has no item; this is the normal
+                // disconnect path. The queue is final once the port count
+                // reads 0, so retry the pop: the first one may have raced
+                // with the last publish.
+                0 => match self.queue.pop() {
+                    Some(data) => Ok(data),
+                    None => Err(RecvTimeoutError::Disconnected),
+                },
+                _ => {
+                    // A permit with no item while senders are alive means the
+                    // semaphore/queue accounting diverged. Report the channel
+                    // as disconnected in release builds instead of panicking
+                    // from a library receive path.
+                    debug_assert!(false, "mpmc: a semaphore permit had no queued item");
+                    Err(RecvTimeoutError::Disconnected)
+                }
             },
         }
     }
@@ -76,7 +114,14 @@ impl<T> InnerQueue<T> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         if !self.sem.try_wait() {
             return match self.tx_ports.load(Ordering::Acquire) {
-                0 => Err(TryRecvError::Disconnected),
+                // Disconnected: a sender may have published its last value
+                // between the failed `try_wait` and this load, so check the
+                // queue before reporting the disconnect. Once the port count
+                // reads 0, no further value can be published.
+                0 => match self.queue.pop() {
+                    Some(data) => Ok(data),
+                    None => Err(TryRecvError::Disconnected),
+                },
                 _ => Err(TryRecvError::Empty),
             };
         }
@@ -84,8 +129,17 @@ impl<T> InnerQueue<T> {
         match self.queue.pop() {
             Some(data) => Ok(data),
             None => match self.tx_ports.load(Ordering::Acquire) {
-                0 => Err(TryRecvError::Disconnected),
-                _ => unreachable!("mpmc try_recv found no data"),
+                // the queue is final once the port count reads 0, so retry
+                // the pop before reporting the disconnect: the first one may
+                // have raced with the last publish
+                0 => match self.queue.pop() {
+                    Some(data) => Ok(data),
+                    None => Err(TryRecvError::Disconnected),
+                },
+                _ => {
+                    debug_assert!(false, "mpmc: a semaphore permit had no queued item");
+                    Err(TryRecvError::Empty)
+                }
             },
         }
     }
@@ -97,14 +151,22 @@ impl<T> InnerQueue<T> {
     pub fn drop_tx(&self) {
         match self.tx_ports.fetch_sub(1, Ordering::SeqCst) {
             1 => {
-                // there is no tx port any more
-                // should tell all the waited rx to come back
-                while self.sem.get_value() == 0 {
-                    self.sem.post();
-                }
+                // There is no tx port any more; wake every parked receiver
+                // so it observes the disconnect. This must be a broadcast,
+                // not a single wake: the stop predicate is permanently true
+                // and every receiver has to re-check it.
+                //
+                // Receivers that register after the drain observe
+                // `tx_ports == 0` through `wait_timeout_until`'s
+                // post-registration check, so no wakeup is lost.
+                self.sem.wake_all();
             }
             n if n > 1 => {}
-            n => panic!("bad number of tx_ports left {n}"),
+            n => {
+                // underflow: an internal accounting bug. Do not panic from a
+                // Drop implementation (it can abort during unwinding).
+                debug_assert!(false, "bad number of tx_ports left {n}");
+            }
         }
     }
 
@@ -119,44 +181,71 @@ impl<T> InnerQueue<T> {
                 while self.queue.pop().is_some() {}
             }
             n if n > 1 => {}
-            n => panic!("bad number of rx_ports left {n}"),
+            n => {
+                debug_assert!(false, "bad number of rx_ports left {n}");
+            }
         }
     }
 }
 
 impl<T> Drop for InnerQueue<T> {
     fn drop(&mut self) {
-        assert_eq!(self.tx_ports.load(Ordering::Acquire), 0);
-        assert_eq!(self.rx_ports.load(Ordering::Acquire), 0);
+        // invariant checks only: panicking in Drop while unwinding aborts
+        debug_assert_eq!(self.tx_ports.load(Ordering::Acquire), 0);
+        debug_assert_eq!(self.rx_ports.load(Ordering::Acquire), 0);
     }
 }
 
+/// The receiving half of an MPMC channel created by [`channel`].
+///
+/// Receivers are cloneable and shareable: each `recv`/`try_recv` consumes at
+/// most one queued value, and concurrent receivers never observe the same
+/// value.
 pub struct Receiver<T> {
     inner: Arc<InnerQueue<T>>,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
-// impl<T> !Sync for Receiver<T> {}
+// MPMC halves are intentionally `Sync` (unlike `mpsc`); values are owned by
+// the queue and only moved out.
+impl<T> UnwindSafe for Receiver<T> {}
+impl<T> RefUnwindSafe for Receiver<T> {}
 
+/// An iterator over the values of a [`Receiver`], blocking until the channel
+/// disconnects.
+#[derive(Debug)]
 pub struct Iter<'a, T: 'a> {
     rx: &'a Receiver<T>,
 }
 
+/// A non-blocking iterator over the currently buffered values of a
+/// [`Receiver`].
+#[derive(Debug)]
 pub struct TryIter<'a, T: 'a> {
     rx: &'a Receiver<T>,
 }
 
+/// An owning iterator over the values of a [`Receiver`].
+#[derive(Debug)]
 pub struct IntoIter<T> {
     rx: Receiver<T>,
 }
 
+/// The sending half of an MPMC channel created by [`channel`].
+///
+/// Cloning a `Sender` creates another handle to the same channel. Senders
+/// never block: the channel is unbounded.
 pub struct Sender<T> {
     inner: Arc<InnerQueue<T>>,
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
-// impl<T> !Sync for Sender<T> {}
+impl<T> UnwindSafe for Sender<T> {}
+impl<T> RefUnwindSafe for Sender<T> {}
 
+/// Create an unbounded multi-producer, multi-consumer channel.
+///
+/// Both halves are cloneable and can be shared between threads or coroutines.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let a = Arc::new(InnerQueue::new());
     (Sender::new(a.clone()), Receiver::new(a))
@@ -171,11 +260,21 @@ impl<T> Sender<T> {
         Sender { inner }
     }
 
+    /// Send a value on the channel, returning it back on error.
+    ///
+    /// Returns `Err` if every receiver has been dropped. Sending never
+    /// blocks: the channel is unbounded.
     pub fn send(&self, t: T) -> Result<(), SendError<T>> {
         self.inner.send(t)
     }
 
-    /// return how many elements in the queue that are not consumed by receivers
+    /// Return a best-effort count of queued items not yet claimed by a
+    /// receiver.
+    ///
+    /// This is the semaphore's permit count: one permit is posted per send
+    /// and consumed by `try_wait` when a receiver pops a value, so it can
+    /// transiently over-report a value whose receiver has been woken but has
+    /// not acquired the permit yet.
     pub fn pressure(&self) -> usize {
         self.inner.sem.get_value()
     }
@@ -209,25 +308,50 @@ impl<T> Receiver<T> {
         Receiver { inner }
     }
 
+    /// Attempt to receive a value without blocking.
+    ///
+    /// Returns [`TryRecvError::Empty`] if the queue is empty and at least one
+    /// sender is alive, and [`TryRecvError::Disconnected`] if every sender has
+    /// been dropped and the queue is empty.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.inner.try_recv()
     }
 
+    /// Block until a value is available or the channel is disconnected.
+    ///
+    /// # Panics
+    ///
+    /// In a coroutine context, panics if the coroutine is canceled while
+    /// waiting.
     pub fn recv(&self) -> Result<T, RecvError> {
         match self.inner.recv(None) {
-            Err(RecvTimeoutError::Timeout) => unreachable!("mpmc recv timeout"),
+            Err(RecvTimeoutError::Timeout) => {
+                debug_assert!(false, "mpmc recv(None) returned a timeout");
+                Err(RecvError)
+            }
             data => data.map_err(|_| RecvError),
         }
     }
 
+    /// Block until a value is available, the timeout expires, or the channel
+    /// is disconnected.
+    ///
+    /// # Panics
+    ///
+    /// In a coroutine context, panics if the coroutine is canceled while
+    /// waiting.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
         self.inner.recv(Some(timeout))
     }
 
+    /// Return an iterator that blocks for each value until the channel
+    /// disconnects.
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { rx: self }
     }
 
+    /// Return an iterator that never blocks, stopping as soon as the channel
+    /// is empty (or disconnected).
     pub fn try_iter(&self) -> TryIter<'_, T> {
         TryIter { rx: self }
     }
@@ -304,6 +428,61 @@ mod tests {
             Ok(val) => val.parse().unwrap(),
             Err(..) => 1,
         }
+    }
+
+    /// Compile-time checks for the parts of the public surface that mirror
+    /// `super::mpsc`.
+    #[test]
+    fn std_api_surface() {
+        // the error types are reachable through this module's path
+        use crate::sync::mpmc::{
+            RecvError, RecvTimeoutError, SendError, TryRecvError, TrySendError,
+        };
+        let _: Option<RecvError> = None;
+        let _: Option<RecvTimeoutError> = None;
+        let _: Option<SendError<()>> = None;
+        let _: Option<TryRecvError> = None;
+        let _: Option<TrySendError<()>> = None;
+
+        // all three iterators implement Debug, like mpsc/std
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<Iter<'static, i32>>();
+        assert_debug::<TryIter<'static, i32>>();
+        assert_debug::<IntoIter<i32>>();
+
+        // both halves are unwind-safe regardless of T
+        fn assert_unwind<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_unwind::<Sender<*mut ()>>();
+        assert_unwind::<Receiver<*mut ()>>();
+
+        // unlike mpsc, both halves are cloneable and shareable
+        fn assert_clone_sync<T: Clone + Sync>() {}
+        assert_clone_sync::<Sender<i32>>();
+        assert_clone_sync::<Receiver<i32>>();
+    }
+
+    /// A coroutine blocked in `recv()` must be woken by cancellation.
+    #[test]
+    fn recv_canceled_while_waiting() {
+        use crate::sleep::sleep;
+        use std::time::Instant;
+
+        let (_tx, rx) = channel::<i32>();
+        let h = go!(move || {
+            let _ = rx.recv();
+        });
+        sleep(Duration::from_millis(50));
+        unsafe { h.coroutine().cancel() };
+
+        let start = Instant::now();
+        while !h.is_done() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            h.is_done(),
+            "cancel did not wake a coroutine blocked in recv()"
+        );
+        assert!(h.join().is_err());
     }
 
     #[test]
@@ -976,6 +1155,24 @@ mod tests {
         assert_eq!(rx1.try_recv(), Err(TryRecvError::Disconnected));
     }
 
+    /// A value published before the last sender dropped must still be
+    /// delivered when the receiver's permit attempt raced with the
+    /// disconnect: reporting `Disconnected` with the value still queued
+    /// loses it for a single receiver.
+    #[test]
+    fn disconnect_does_not_hide_a_queued_value() {
+        let (tx, rx) = channel::<i32>();
+        tx.send(1).unwrap();
+        // Simulate a receiver that raced with the final publish: the permit
+        // was consumed (a hand-off that lost to a waiter leaving) while the
+        // value stays queued.
+        assert!(rx.inner.sem.try_wait());
+        drop(tx);
+
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
     // This bug used to end up in a livelock inside of the Receiver destructor
     // because the internal state of the Shared packet was corrupted
     #[test]
@@ -1033,5 +1230,44 @@ mod tests {
             }
         }
         assert!(rx1.try_recv().is_err());
+    }
+
+    /// Every receiver must observe the disconnect, including one that registers
+    /// for the semaphore after the last sender's wakeup posts have run.
+    ///
+    /// Regression: a single spare permit was left by `drop_tx`, so if another
+    /// receiver consumed it first, the late receiver parked forever.
+    #[test]
+    fn multi_receiver_disconnect_wakeup() {
+        use std::time::Instant;
+
+        const N: usize = 8;
+        for iter in 0..100 {
+            let (tx, rx) = channel::<i32>();
+            let done = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..N {
+                let rx = rx.clone();
+                let done = done.clone();
+                handles.push(thread::spawn(move || {
+                    let _ = rx.recv();
+                    done.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            drop(tx);
+
+            let start = Instant::now();
+            while done.load(Ordering::SeqCst) < N && start.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let n = done.load(Ordering::SeqCst);
+            assert_eq!(
+                n, N,
+                "iter {iter}: only {n}/{N} receivers woke on disconnect"
+            );
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
     }
 }

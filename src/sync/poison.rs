@@ -6,6 +6,8 @@ use std::sync::{LockResult, PoisonError};
 use std::thread;
 
 pub struct Flag {
+    // Best-effort: poisoning is advisory, and a thread that joins the
+    // panicking thread observes the flag through the join's synchronization.
     failed: AtomicUsize,
 }
 
@@ -30,7 +32,12 @@ impl Flag {
 
     #[inline]
     pub fn done(&self, guard: &Guard) {
-        if !guard.panicking && thread::panicking() {
+        // `thread::panicking()` is true while any unwind is in flight on this
+        // thread — including a *suspended* coroutine Cancel-panic unwind,
+        // during which other coroutines keep running on the thread. In that
+        // window their guards must not poison: the "panic" is not theirs and
+        // not a real panic at all.
+        if !guard.panicking && thread::panicking() && !crate::cancel::cancel_panic_in_flight() {
             let is_canceled = if crate::coroutine_impl::is_coroutine() {
                 let cancel = crate::coroutine_impl::current_cancel_data();
                 cancel.is_canceled()
@@ -47,6 +54,12 @@ impl Flag {
     #[inline]
     pub fn get(&self) -> bool {
         self.failed.load(Ordering::Relaxed) != 0
+    }
+
+    // clear the poisoned state
+    #[inline]
+    pub fn clear(&self) {
+        self.failed.store(0, Ordering::Relaxed);
     }
 }
 

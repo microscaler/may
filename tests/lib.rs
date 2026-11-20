@@ -82,6 +82,42 @@ fn cancel_io_coroutine() {
     }
 }
 
+// A coroutine blocked in `WaitIo::wait_io` must unwind on cancel. This is the
+// regression test for the `RawIoBlock::yield_back` override that used to clear
+// the cancel bit instead of re-checking it, leaving `join()` hanging forever.
+#[test]
+#[cfg(all(unix, feature = "io_cancel"))]
+fn cancel_wait_io_coroutine() {
+    use may::io::WaitIo;
+    use std::sync::mpsc::channel;
+
+    let (tx, rx) = channel();
+
+    let j = go!(move || {
+        // a listening socket has no io event until a connection arrives, so
+        // `wait_io()` suspends the coroutine until a cancel resumes it
+        let listener = may::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        tx.send(()).unwrap();
+        listener.wait_io()
+    });
+
+    // wait until the coroutine is blocked in wait_io
+    rx.recv().unwrap();
+
+    unsafe { j.coroutine().cancel() };
+
+    match j.join() {
+        Ok(_) => panic!("test should return panic"),
+        Err(panic) => {
+            use generator::Error;
+            match panic.downcast_ref::<Error>() {
+                Some(&Error::Cancel) => println!("coroutine cancelled"),
+                _ => panic!("panic type wrong"),
+            }
+        }
+    }
+}
+
 #[test]
 fn one_coroutine() {
     let j = go!(move || {
@@ -98,6 +134,17 @@ fn coroutine_result() {
     });
 
     assert_eq!(j.join().unwrap(), 100);
+}
+
+// the result is too large to fit an atomic word and is not `Sync`, so the
+// result packet takes the boxed fallback
+#[test]
+fn coroutine_result_non_sync_and_large() {
+    use std::cell::Cell;
+
+    let j = go!(move || Cell::new([1u64, 2u64]));
+    let result = j.join().unwrap();
+    assert_eq!(result.get(), [1, 2]);
 }
 
 #[test]
@@ -190,6 +237,150 @@ fn scoped_coroutine() {
     assert_eq!(array[0], 2);
     assert_eq!(array[1], 3);
     assert_eq!(array[2], 4);
+}
+
+#[test]
+fn scope_returns_value() {
+    let value = coroutine::scope(|_scope| 42);
+    assert_eq!(value, 42);
+}
+
+#[test]
+fn scoped_handle_join_returns_result() {
+    let mut x = 0;
+    let value = coroutine::scope(|scope| {
+        let handle = scope.spawn(|| {
+            x += 1;
+            x * 2
+        });
+        handle.join().unwrap()
+    });
+
+    assert_eq!(value, 2);
+    assert_eq!(x, 1);
+}
+
+#[test]
+fn scoped_handle_join_returns_panic() {
+    let had_panic = coroutine::scope(|scope| {
+        let handle = scope.spawn(|| -> () { panic!("scoped panic") });
+        handle.join().is_err()
+    });
+
+    assert!(had_panic);
+}
+
+#[test]
+#[should_panic(expected = "scoped panic")]
+fn scoped_unjoined_panic_propagates() {
+    coroutine::scope(|scope| {
+        scope.spawn(|| -> () { panic!("scoped panic") });
+    });
+}
+
+#[test]
+fn scoped_nested_spawn() {
+    let mut x = 0;
+    coroutine::scope(|scope| {
+        scope.spawn(|| {
+            scope.spawn(|| {
+                x += 1;
+            });
+        });
+    });
+
+    assert_eq!(x, 1);
+}
+
+#[test]
+fn scoped_defer_runs_lifo() {
+    use std::sync::Mutex;
+
+    let order = Mutex::new(Vec::new());
+    coroutine::scope(|scope| {
+        scope.defer(|| order.lock().unwrap().push(1));
+        scope.defer(|| order.lock().unwrap().push(2));
+    });
+
+    assert_eq!(*order.lock().unwrap(), vec![2, 1]);
+}
+
+#[test]
+fn scoped_panicking_defer_still_joins() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let child_done = Arc::new(AtomicBool::new(false));
+    let c = child_done.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        coroutine::scope(|scope| {
+            scope.spawn(move || {
+                coroutine::sleep(Duration::from_millis(10));
+                c.store(true, Ordering::SeqCst);
+            });
+            // this dtor runs before the auto-join of the coroutine above
+            scope.defer(|| panic!("defer panic"));
+        })
+    }));
+
+    assert!(result.is_err());
+    assert!(child_done.load(Ordering::SeqCst));
+}
+
+#[test]
+fn scoped_body_panic_still_joins() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let child_done = Arc::new(AtomicBool::new(false));
+    let c = child_done.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        coroutine::scope(|scope| -> () {
+            scope.spawn(move || {
+                coroutine::sleep(Duration::from_millis(10));
+                c.store(true, Ordering::SeqCst);
+            });
+            panic!("body panic");
+        })
+    }));
+
+    assert!(result.is_err());
+    assert!(child_done.load(Ordering::SeqCst));
+}
+
+#[test]
+fn scoped_handle_is_finished() {
+    coroutine::scope(|scope| {
+        let handle = scope.spawn(|| ());
+        while !handle.is_finished() {
+            yield_now();
+        }
+        assert!(handle.join().is_ok());
+    });
+}
+
+#[test]
+fn scoped_builder_spawn() {
+    let value = coroutine::scope(|scope| {
+        coroutine::Builder::new()
+            .stack_size(0x20_000)
+            .spawn_scoped(scope, || 21)
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+
+    assert_eq!(value, 21);
+}
+
+#[test]
+fn scoped_builder_spawn_invalid_id() {
+    coroutine::scope(|scope| {
+        let result = coroutine::Builder::new()
+            .id(usize::MAX)
+            .spawn_scoped(scope, || ());
+        assert!(result.is_err());
+    });
 }
 
 #[test]
@@ -304,17 +495,20 @@ fn join_macro() {
     join!(
         coroutine::sleep(Duration::from_millis(1000)),
         {
+            // `Receiver` is `!Sync`, so move it into the scoped coroutine
+            // instead of borrowing it.
+            let rx1 = rx1;
             let x = rx1.recv().unwrap();
-            assert_eq!(x, 42)
+            assert_eq!(x, 42);
+            assert!(rx1.try_recv().is_err());
         },
         {
+            let rx2 = rx2;
             let a = rx2.recv().unwrap();
-            assert_eq!(a, "hello")
+            assert_eq!(a, "hello");
+            assert!(rx2.try_recv().is_err());
         }
     );
-
-    assert!(rx1.try_recv().is_err());
-    assert!(rx2.try_recv().is_err());
 }
 
 #[test]
