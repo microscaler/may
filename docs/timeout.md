@@ -1,5 +1,10 @@
 # PRD: `may::sync::spsc::recv_with_timeout`
 
+> **Superseded (20 Nov 2026).** This landed upstream as `spsc::Receiver::recv_timeout` (may 0.3.52), with std's
+> `RecvTimeoutError`, and the fork now carries upstream's version only. `recv_with_timeout` and the fork's
+> `spsc::RecvError { Timeout, Disconnected }` are gone: call `recv_timeout` and match
+> `RecvTimeoutError::{Timeout, Disconnected}`. Kept as the design record.
+
 | Field | Value |
 |-------|-------|
 | **Status** | **Implemented** on branch `may-sleep` — pending merge to `microscaler/may` |

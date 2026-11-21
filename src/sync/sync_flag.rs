@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::blocking::SyncBlocker;
+use super::blocking::{cancel_pending, SyncBlocker};
 use crate::cancel::trigger_cancel_panic;
 use crate::park::ParkError;
 use crossbeam::queue::SegQueue;
@@ -43,8 +43,8 @@ use crossbeam::queue::SegQueue;
 /// flag.wait();
 /// ```
 pub struct SyncFlag {
-    // track how many resources available for the SyncFlag
-    // if it's negative means how many threads are waiting for
+    // waiter count: negative while waiters are queued, and `isize::MAX` once
+    // fired (the "true" state)
     cnt: AtomicIsize,
     // the waiting blocker list, must be mpmc
     to_wake: SegQueue<Arc<SyncBlocker>>,
@@ -65,13 +65,18 @@ impl SyncFlag {
         Default::default()
     }
 
+    // Wake every waiter. `fire` is level-triggered (`cnt` is set to
+    // `isize::MAX` and never drops back), so unlike a notify-one hand-off
+    // there is no permit to forward past released blockers: just drain the
+    // queue. Iterative because a cancel storm can leave many released
+    // blockers queued, and re-entering `fire` recursively would overflow the
+    // (small) default coroutine stack.
     #[inline]
     fn wakeup_all(&self) {
         while let Some(w) = self.to_wake.pop() {
-            w.unpark();
-            if w.take_release() {
-                self.fire();
-            }
+            // nothing needs to be forwarded for a broadcast wakeup; the
+            // result only says whether the waiter was still live
+            w.try_hand_off();
         }
     }
 
@@ -91,18 +96,23 @@ impl SyncFlag {
         }
 
         match cur.park(dur) {
-            Ok(_) => true,
+            Ok(_) => {
+                // A `fire` can beat `cancel` and consume the park
+                // registration, leaving only the cancel bit set. `fire` is
+                // level-triggered, so no wakeup has to be forwarded, but the
+                // wait must still unwind instead of returning to a canceled
+                // coroutine.
+                if cancel_pending() {
+                    trigger_cancel_panic();
+                }
+                true
+            }
             Err(err) => {
-                // check the unpark status
-                if cur.is_unparked() {
+                // a fire may have woken us concurrently; a fire is
+                // level-triggered so re-firing is harmless, but it must not be
+                // lost for the remaining waiters
+                if cur.leave_wait() {
                     self.fire();
-                } else {
-                    // register
-                    cur.set_release();
-                    // re-check unpark status
-                    if cur.is_unparked() && cur.take_release() {
-                        self.fire();
-                    }
                 }
 
                 // now we can safely go with the cancel panic
@@ -114,15 +124,31 @@ impl SyncFlag {
         }
     }
 
-    /// wait for a SyncFlag
-    /// if the SyncFlag value is bigger than zero the function returns immediately
-    /// otherwise it would block the until a `fire` is executed
+    /// Wait for a `SyncFlag`.
+    ///
+    /// If the flag is already fired the function returns immediately,
+    /// otherwise it blocks until a `fire` is executed.
+    ///
+    /// # Panics
+    ///
+    /// In a coroutine context, panics if the coroutine is canceled while
+    /// waiting.
     pub fn wait(&self) {
         self.wait_timeout_impl(None);
     }
 
-    /// same as `wait` except that with an extra timeout value
-    /// return false if timeout happened
+    /// Same as [`wait`](Self::wait), but returns `false` if the timeout
+    /// expired before the flag was fired.
+    ///
+    /// A timed-out waiter leaves its blocker in the internal queue until a
+    /// later `fire` pops it, so a timeout-polling loop retains one blocker
+    /// per timeout until the flag is fired.
+    ///
+    /// # Panics
+    ///
+    /// In a coroutine context, panics if the coroutine is canceled while
+    /// waiting.
+    #[must_use = "returns false when the timeout expired"]
     pub fn wait_timeout(&self, dur: Duration) -> bool {
         self.wait_timeout_impl(Some(dur))
     }
@@ -248,5 +274,43 @@ mod tests {
         // release the SyncFlag
         flag1.fire();
         h2.join().unwrap();
+    }
+
+    /// Regression test for the release-forwarding chain: canceled waiters
+    /// leave released blockers queued, and a single `fire` must walk past all
+    /// of them. The old implementation re-entered `fire` recursively and
+    /// overflowed the coroutine stack (then 32KB by default) on a chain this
+    /// long.
+    #[test]
+    fn released_waiters_are_woken_iteratively() {
+        use crate::sleep::sleep;
+
+        const N: usize = 1000;
+
+        let flag = Arc::new(SyncFlag::new());
+        let waiters: Vec<_> = (0..N)
+            .map(|_| {
+                let f = flag.clone();
+                go!(move || f.wait())
+            })
+            .collect();
+
+        // let the waiters enqueue, then cancel them all; each leaves a
+        // released blocker behind
+        sleep(Duration::from_millis(50));
+        for w in &waiters {
+            unsafe { w.coroutine().cancel() };
+        }
+        for w in waiters {
+            assert!(w.join().is_err());
+        }
+
+        // run the fire (and thus the drain) on a coroutine stack
+        let f = flag.clone();
+        go!(move || f.fire()).join().unwrap();
+
+        assert!(flag.is_fired());
+        // the fired state wakes future waiters immediately
+        flag.wait();
     }
 }

@@ -1,19 +1,14 @@
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::io::OwnedFd;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-#[cfg(feature = "io_timeout")]
 use std::time::Duration;
 use std::{io, ptr};
 
-#[cfg(feature = "io_timeout")]
-use super::{timeout_handler, TimerList};
+use super::select_loop::{Ready, ShardState};
 use super::{EventData, IoData};
 use crate::scheduler::Scheduler;
 #[cfg(feature = "io_timeout")]
-use crate::timeout_list::now;
+use crate::sync::WaitCo;
 
-use may_queue::mpsc::Queue;
 use smallvec::SmallVec;
 
 pub type SysEvent = libc::kevent;
@@ -48,9 +43,7 @@ macro_rules! syscall {
 
 struct SingleSelector {
     kqfd: OwnedFd,
-    #[cfg(feature = "io_timeout")]
-    timer_list: TimerList,
-    free_ev: Queue<Arc<EventData>>,
+    state: ShardState,
 }
 
 impl AsRawFd for SingleSelector {
@@ -80,9 +73,7 @@ impl SingleSelector {
 
         Ok(SingleSelector {
             kqfd,
-            free_ev: Queue::new(),
-            #[cfg(feature = "io_timeout")]
-            timer_list: TimerList::new(),
+            state: ShardState::new(),
         })
     }
 }
@@ -107,94 +98,65 @@ impl Selector {
     }
 
     #[inline]
+    fn shard_id(&self, fd: i32) -> usize {
+        fd as usize % self.vec.len()
+    }
+
+    #[inline]
     pub fn select(
         &self,
         scheduler: &Scheduler,
         id: usize,
         events: &mut [SysEvent],
-        _timeout: Option<u64>,
+        timeout: Option<u64>,
     ) -> io::Result<Option<u64>> {
         assert!(id < self.vec.len());
-        #[cfg(feature = "io_timeout")]
-        let timeout_spec = _timeout.map(|to| {
-            let dur = Duration::from_nanos(to);
-            libc::timespec {
-                tv_sec: dur.as_secs() as libc::time_t,
-                tv_nsec: dur.subsec_nanos() as libc::c_long,
-            }
-        });
-
-        #[cfg(feature = "io_timeout")]
-        let timeout = timeout_spec
-            .as_ref()
-            .map(|s| s as *const _)
-            .unwrap_or(ptr::null());
-        #[cfg(not(feature = "io_timeout"))]
-        let timeout = ptr::null();
-        // debug!("select; timeout={:?}", timeout_spec);
-
         let single_selector = &self.vec[id];
-
-        // Wait for kqueue events for at most timeout_ms milliseconds
         let kqfd = single_selector.as_raw_fd();
-        let n = syscall!(kevent(
-            kqfd,
-            ptr::null(),
-            0,
-            events.as_mut_ptr(),
-            events.len() as libc::c_int,
+
+        single_selector.state.select(
+            scheduler,
+            id,
+            events,
             timeout,
-        ))?;
+            |remaining, events| {
+                let timeout_spec = remaining.map(|to| {
+                    let dur = Duration::from_nanos(to);
+                    libc::timespec {
+                        tv_sec: dur.as_secs() as libc::time_t,
+                        tv_nsec: dur.subsec_nanos() as libc::c_long,
+                    }
+                });
+                let timeout = timeout_spec
+                    .as_ref()
+                    .map(|s| s as *const _)
+                    .unwrap_or(ptr::null());
+                // debug!("select; timeout={:?}", timeout_spec);
 
-        let n = n as usize;
-
-        for event in unsafe { events.get_unchecked(..n) } {
-            if event.ident == NOTIFY_IDENT && event.filter == libc::EVFILT_USER {
-                scheduler.collect_global(id);
-                continue;
-            }
-            let data = unsafe { &mut *(event.udata as *mut EventData) };
-            // info!("select got event, data={:p}", data);
-            data.io_flag
-                .fetch_or(event.flags as usize, Ordering::Release);
-
-            // first check the atomic co, this may be grab by the worker first
-            let co = match data.co.take() {
-                None => continue,
-                Some(co) => co,
-            };
-
-            // it's safe to remove the timer since we are running the timer_list in the same thread
-            #[cfg(feature = "io_timeout")]
-            data.timer.borrow_mut().take().map(|h| {
-                unsafe {
-                    // tell the timer handler not to cancel the io
-                    // it's not always true that you can really remove the timer entry
-                    h.with_mut_data(|value| value.data.event_data = ptr::null_mut());
+                // Wait for kqueue events for at most timeout_spec
+                syscall!(kevent(
+                    kqfd,
+                    ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    timeout,
+                ))
+                .map(|n| n as usize)
+            },
+            |event| {
+                if event.ident == NOTIFY_IDENT && event.filter == libc::EVFILT_USER {
+                    Ready::Wakeup
+                } else {
+                    // the event data is shared through `Arc`, so only a shared
+                    // reference may be created here; everything touched on it is
+                    // interior-mutable (atomics / `AtomicOption`)
+                    let data = unsafe { &*(event.udata as *const EventData) };
+                    // info!("select got event, data={:p}", data);
+                    Ready::Io(data, event.flags as usize)
                 }
-                h.remove()
-            });
-
-            #[cfg(feature = "work_steal")]
-            scheduler.schedule_with_id(co, id);
-            #[cfg(not(feature = "work_steal"))]
-            crate::coroutine_impl::run_coroutine(co);
-        }
-
-        // run all the local tasks
-        scheduler.run_queued_tasks(id);
-
-        // free the unused event_data
-        self.free_unused_event_data(id);
-
-        // deal with the timer list
-        #[cfg(feature = "io_timeout")]
-        let next_expire = single_selector
-            .timer_list
-            .schedule_timer(now(), &timeout_handler);
-        #[cfg(not(feature = "io_timeout"))]
-        let next_expire = None;
-        Ok(next_expire)
+            },
+        )
     }
 
     // this will post an os event so that we can wakeup the event loop
@@ -219,9 +181,9 @@ impl Selector {
 
     // register io event to the selector
     #[inline]
-    pub fn add_fd(&self, io_data: IoData) -> io::Result<IoData> {
+    pub fn add_fd(&self, mut io_data: IoData) -> io::Result<IoData> {
         let fd = io_data.fd;
-        let id = fd as usize % self.vec.len();
+        let id = self.shard_id(fd);
         let kqfd = self.vec[id].as_raw_fd();
 
         let flags = libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT;
@@ -231,6 +193,9 @@ impl Selector {
             kevent!(fd, libc::EVFILT_WRITE, flags, udata),
         ];
 
+        // Only mark the io data as registered after a successful submission.
+        // If this fails, dropping the io data must not issue a DEL: it would
+        // remove any pre-existing filters of the same fd.
         syscall!(kevent(
             kqfd,
             changes.as_ptr(),
@@ -239,6 +204,7 @@ impl Selector {
             changes.len() as libc::c_int,
             ptr::null(),
         ))?;
+        io_data.mark_registered();
 
         debug!("add fd to kqueue select, fd={:?}", fd);
         Ok(io_data)
@@ -247,7 +213,7 @@ impl Selector {
     #[inline]
     pub fn mod_fd(&self, io_data: &IoData, is_read: bool) -> io::Result<()> {
         let fd = io_data.fd;
-        let id = fd as usize % self.vec.len();
+        let id = self.shard_id(fd);
         let kqfd = self.vec[id].as_raw_fd();
 
         let flags = libc::EV_CLEAR | libc::EV_RECEIPT;
@@ -279,19 +245,15 @@ impl Selector {
 
     #[inline]
     pub fn del_fd(&self, io_data: &IoData) {
+        // mark the timer as removed if any, this only happened when cancel
+        // an IO. what if the timer expired at the same time? because we run
+        // this func in the user space, so the timer handler will not got the
+        // coroutine
         #[cfg(feature = "io_timeout")]
-        if let Some(h) = io_data.timer.borrow_mut().take() {
-            unsafe {
-                // mark the timer as removed if any, this only happened
-                // when cancel an IO. what if the timer expired at the same time?
-                // because we run this func in the user space, so the timer handler
-                // will not got the coroutine
-                h.with_mut_data(|value| value.data.event_data = ptr::null_mut());
-            }
-        }
+        io_data.take_timer();
 
         let fd = io_data.fd;
-        let id = fd as usize % self.vec.len();
+        let id = self.shard_id(fd);
         let single_selector = &self.vec[id];
         let kqfd = single_selector.as_raw_fd();
 
@@ -313,29 +275,30 @@ impl Selector {
         .ok();
 
         debug!("del fd from kqueue select, fd={:?}", fd);
-        // after EpollCtlDel push the unused event data
-        single_selector.free_ev.push((*io_data).clone());
-    }
-
-    // we can't free the event data directly in the worker thread
-    // must free them before the next epoll_wait
-    #[inline]
-    fn free_unused_event_data(&self, id: usize) {
-        let free_ev = &&self.vec[id].free_ev;
-        while !free_ev.bulk_pop().is_empty() {}
+        // hand the event data to the owning event loop for release, waking it
+        // off the batch's first push, see `ShardState::discard`
+        single_selector.state.discard(io_data, || self.wakeup(id));
     }
 
     // register the io request to the timeout list
     #[inline]
     #[cfg(feature = "io_timeout")]
-    pub fn add_io_timer(&self, io: &IoData, timeout: Duration) {
-        let id = io.fd as usize % self.vec.len();
+    pub fn add_io_timer(&self, io: &EventData, timeout: Duration, wait: WaitCo) {
+        let id = self.shard_id(io.fd);
         // info!("io timeout = {:?}", dur);
-        let (h, b_new) = self.vec[id].timer_list.add_timer(timeout, io.timer_data());
+        let state = &self.vec[id].state;
+        let (h, b_new, deadline) = state.timer_list.add_timer(timeout, wait);
         if b_new {
-            // wakeup the event loop thread to recall the next wait timeout
-            self.wakeup(id);
+            // wakeup the event loop thread to recall the next wait timeout,
+            // unless its current wait already ends before this timer is due
+            state.wake_timer(deadline, || self.wakeup(id));
         }
-        io.timer.borrow_mut().replace(h);
+        // The wait is already published, so it may be resumed while it is
+        // being armed (a zero-duration timer or an io event). The handle is
+        // kept only as a best-effort disarm for this wait: a concurrent
+        // publish may replace it, in which case the disarmed entry belongs to
+        // a different wait. That is harmless because every entry owns the
+        // (emptied) slot of the wait it was armed for.
+        io.timer.store(h);
     }
 }

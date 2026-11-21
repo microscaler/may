@@ -2,22 +2,29 @@
 //! please ref the doc from std::sync::mutex
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::{LockResult, TryLockError, TryLockResult};
+use std::sync::{LockResult, OnceLock, TryLockError, TryLockResult};
 
-use super::blocking::SyncBlocker;
+use super::blocking::{cancel_disabled, cancel_pending, SyncBlocker};
 use super::poison;
 use crate::cancel::trigger_cancel_panic;
 use crate::park::ParkError;
 
-use may_queue::mpsc::Queue;
+use crossbeam::queue::SegQueue as Queue;
 
+/// A mutual exclusion primitive useful for protecting shared data.
+///
+/// Works for both threads and coroutines (see the module docs): blocking in
+/// a coroutine yields the underlying thread instead of blocking it, and the
+/// wait can be canceled. Waiter hand-off is FIFO.
 pub struct Mutex<T: ?Sized> {
-    // the waiting blocker list
-    to_wake: Queue<Arc<SyncBlocker>>,
+    // the waiting blocker list, allocated lazily on first contention
+    // so that `Mutex::new` can be a const fn
+    to_wake: OnceLock<Queue<Arc<SyncBlocker>>>,
     // track how many blockers are waiting on the mutex
     cnt: AtomicUsize,
     poison: poison::Flag,
@@ -29,20 +36,45 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 impl<T: ?Sized> UnwindSafe for Mutex<T> {}
 impl<T: ?Sized> RefUnwindSafe for Mutex<T> {}
 
+/// An RAII guard granting exclusive access to the mutex's data.
+///
+/// The guard unlocks the mutex when dropped. Like
+/// [`std::sync::MutexGuard`], it must stay on the locking thread: it is
+/// `!Send`, and `&MutexGuard<T>` is `Sync` only when `T: Sync`, because shared
+/// access to the guard is shared access to the data.
+///
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<may::sync::MutexGuard<'static, std::cell::Cell<u32>>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn assert_send<T: Send>() {}
+/// assert_send::<may::sync::MutexGuard<'static, u32>>();
+/// ```
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     // funny underscores due to how Deref/DerefMut currently work (they
     // disregard field privacy).
     __lock: &'a Mutex<T>,
     __poison: poison::Guard,
+    // `*mut ()` is neither `Send` nor `Sync`; this keeps the guard on the
+    // locking thread (the poison guard uses `thread::panicking()` on drop).
+    // The manual `Sync` impl below restores `Sync` for `T: Sync`.
+    _marker: PhantomData<*mut ()>,
 }
 
-// impl<'a, T: ?Sized> !Send for MutexGuard<'a, T> {}
+// `&MutexGuard<T>` only exposes `&T`, so it is `Sync` exactly when `T: Sync`
+// (std's bound); the raw-pointer marker keeps the guard `!Send`.
+unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
 impl<T> Mutex<T> {
     /// Creates a new mutex in an unlocked state ready for use.
-    pub fn new(t: T) -> Mutex<T> {
+    ///
+    /// This is a `const fn`: the waiter queue is initialized lazily on
+    /// first contention, so an uncontended mutex never allocates.
+    pub const fn new(t: T) -> Mutex<T> {
         Mutex {
-            to_wake: Queue::new(),
+            to_wake: OnceLock::new(),
             cnt: AtomicUsize::new(0),
             poison: poison::Flag::new(),
             data: UnsafeCell::new(t),
@@ -51,6 +83,19 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
+    /// Acquires the mutex, blocking the current thread or coroutine until it
+    /// is available.
+    ///
+    /// For a coroutine, the wait is cancellable: if the coroutine is
+    /// canceled while waiting for the lock, the cancel panic is propagated
+    /// and the lock is not acquired.
+    ///
+    /// # Errors
+    ///
+    /// If another user of this mutex panicked while holding it, then this
+    /// call returns an error once the mutex is acquired. The lock is still
+    /// acquired in that case; recover the guard from the error and dropping
+    /// it unlocks the mutex.
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
         // try lock first
         match self.try_lock() {
@@ -59,60 +104,71 @@ impl<T: ?Sized> Mutex<T> {
             Err(TryLockError::Poisoned(e)) => return Err(e),
         }
 
+        let wait_queue = self.to_wake.get_or_init(Queue::new);
         let cur = SyncBlocker::current();
         // register blocker first
-        self.to_wake.push(cur.clone());
+        wait_queue.push(cur.clone());
         // inc the cnt, if it's the first grab, unpark the first waiter
         if self.cnt.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.to_wake
-                .pop()
-                .map(|w| self.unpark_one(&w))
-                .expect("got null blocker!");
-        }
-        loop {
-            match cur.park(None) {
-                Ok(_) => {
-                    break;
-                }
-                Err(ParkError::Timeout) => unreachable!("mutex timeout"),
-                Err(ParkError::Canceled) => {
-                    let b_ignore = if crate::coroutine_impl::is_coroutine() {
-                        let cancel = crate::coroutine_impl::current_cancel_data();
-                        cancel.is_disabled()
-                    } else {
-                        false
-                    };
-                    // check the unpark status
-                    if cur.is_unparked() {
-                        if b_ignore {
-                            break;
-                        }
-                        self.unlock();
-                    } else {
-                        // register
-                        cur.set_release();
-                        // re-check unpark status
-                        if cur.is_unparked() && cur.take_release() {
-                            if b_ignore {
-                                break;
-                            }
-                            self.unlock();
-                        }
-                    }
-                    // we ignore the cancel, just to wait the actual event
-                    if b_ignore {
-                        continue;
-                    }
-
-                    // now we can safely go with the cancel panic
-                    trigger_cancel_panic();
-                }
+            let w = wait_queue.pop().expect("got null blocker!");
+            if !w.try_hand_off() {
+                self.unlock();
             }
         }
 
-        MutexGuard::new(self)
+        let mut ret = cur.park(None);
+        // A cancel that lands while cancellation is disabled is deferred: the
+        // caller (`Condvar`'s re-lock) panics at a safe point afterwards, so
+        // the wait has to survive the cancel and keep waiting for the lock.
+        // Stop as soon as the lock has been handed over to us.
+        while ret == Err(ParkError::Canceled) && !cur.is_unparked() && cancel_disabled() {
+            ret = cur.park(None);
+        }
+        // A deferred cancel can race with the hand-off: `cancel` takes the
+        // park registration first, then the unlock pops our blocker and counts
+        // us as the owner. The canceled park reports `Canceled`, but the lock
+        // is ours, so take it and let the caller handle the deferred cancel
+        // after it re-enables cancellation. Panicking here would unwind
+        // through `Condvar`'s caller-owned guard and unlock a mutex this wait
+        // no longer owns.
+        if ret == Err(ParkError::Canceled) && cur.is_unparked() && cancel_disabled() {
+            ret = Ok(());
+        }
+
+        match ret {
+            Ok(_) => {
+                // the wake can beat the cancel, which then has nothing left to
+                // schedule: the cancel bit is set but the park returned Ok, so
+                // the lock must not be handed to a canceled wait
+                if cancel_pending() {
+                    self.unlock();
+                    trigger_cancel_panic();
+                }
+                MutexGuard::new(self)
+            }
+            Err(ParkError::Timeout) => unreachable!("mutex timeout"),
+            Err(ParkError::Canceled) => {
+                // the lock may have been handed over concurrently with the
+                // cancellation; `leave_wait` decides atomically which side
+                // forwards it
+                if cur.leave_wait() {
+                    self.unlock();
+                }
+                // now we can safely go with the cancel panic
+                trigger_cancel_panic();
+            }
+        }
     }
 
+    /// Attempts to acquire the mutex without blocking.
+    ///
+    /// # Errors
+    ///
+    /// * [`TryLockError::WouldBlock`] if the lock is currently held by
+    ///   another thread or coroutine.
+    /// * [`TryLockError::Poisoned`] if the lock was acquired but is
+    ///   poisoned; the guard can be recovered from the error and unlocking
+    ///   happens when the error is dropped.
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
         match self
             .cnt
@@ -123,27 +179,57 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
-    fn unpark_one(&self, w: &SyncBlocker) {
-        w.unpark();
-        if w.take_release() {
-            self.unlock();
-        }
-    }
-
+    /// Pop one waiter from the queue and unpark it.
+    ///
+    /// This function is called internally when the mutex is unlocked to wake up
+    /// one of the waiting coroutines, if any. It will continue to unpark waiters
+    /// until it finds one that is not canceled.
     fn unlock(&self) {
-        if self.cnt.fetch_sub(1, Ordering::SeqCst) > 1 {
-            self.to_wake
-                .pop()
-                .map(|w| self.unpark_one(&w))
-                .expect("got null blocker!");
+        let wait_queue = self.to_wake.get_or_init(Queue::new);
+        let mut cnt = self.cnt.fetch_sub(1, Ordering::SeqCst);
+        while cnt > 1 {
+            let w = wait_queue.pop().expect("got null blocker!");
+            if w.try_hand_off() {
+                break;
+            }
+            cnt = self.cnt.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
+    /// Returns `true` if the mutex is poisoned.
+    ///
+    /// A mutex gets poisoned when a panic unwinds through a guard that was
+    /// not caused by a coroutine cancellation.
     #[inline]
     pub fn is_poisoned(&self) -> bool {
         self.poison.get()
     }
 
+    /// Clears the poisoned state from this mutex.
+    ///
+    /// If the mutex is poisoned, it will remain poisoned until this function
+    /// is called. This allows recovering from a poisoned state and marking
+    /// that it has recovered. For example, if the value is overwritten by a
+    /// known-good value, then the mutex can be marked as un-poisoned. Or
+    /// possibly, the value could be inspected to determine if it is in a
+    /// consistent state, and if so the poison is removed.
+    pub fn clear_poison(&self) {
+        self.poison.clear();
+    }
+
+    /// Consumes this mutex, returning the underlying data.
+    ///
+    /// This does not attempt to acquire the lock, so it is up to the caller
+    /// to ensure the mutex is not locked — in particular, no waiter may be
+    /// parked in [`Mutex::lock`] on another reference to the mutex, or that
+    /// waiter would be handed the lock after the data is destroyed
+    /// (undefined behavior). This is the same contract as
+    /// [`std::sync::Mutex::into_inner`].
+    ///
+    /// # Errors
+    ///
+    /// If the mutex is poisoned, the data is still returned, wrapped in a
+    /// `PoisonError`.
     pub fn into_inner(self) -> LockResult<T>
     where
         T: Sized,
@@ -152,6 +238,18 @@ impl<T: ?Sized> Mutex<T> {
         poison::map_result(self.poison.borrow(), |_| data)
     }
 
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the `Mutex` mutably, no actual locking needs
+    /// to take place — but the caller must ensure the mutex is not locked
+    /// (and has no parked waiters) anywhere else, e.g. by owning the only
+    /// reference via `Arc::try_unwrap`. Violating this is undefined
+    /// behavior.
+    ///
+    /// # Errors
+    ///
+    /// If the mutex is poisoned, the data is still returned, wrapped in a
+    /// `PoisonError`.
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
         // We know statically that there are no other references to `self`, so
         // there's no need to lock the inner lock.
@@ -163,6 +261,14 @@ impl<T: ?Sized> Mutex<T> {
 impl<T: Default> Default for Mutex<T> {
     fn default() -> Mutex<T> {
         Mutex::new(Default::default())
+    }
+}
+
+impl<T> From<T> for Mutex<T> {
+    /// Creates a new mutex in an unlocked state ready for use.
+    /// This is equivalent to [`Mutex::new`].
+    fn from(t: T) -> Mutex<T> {
+        Mutex::new(t)
     }
 }
 
@@ -180,12 +286,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
 
 impl<'mutex, T: ?Sized> MutexGuard<'mutex, T> {
     fn new(lock: &'mutex Mutex<T>) -> LockResult<MutexGuard<'mutex, T>> {
-        // after get the lock we should sync the mem
-        fence(Ordering::SeqCst);
-
+        // the acquire ordering is provided by the SeqCst operations on
+        // `cnt` in the lock/unlock paths, no extra fence is needed
         poison::map_result(lock.poison.borrow(), |guard| MutexGuard {
             __lock: lock,
             __poison: guard,
+            _marker: PhantomData,
         })
     }
 }
@@ -208,9 +314,8 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
         self.__lock.poison.done(&self.__poison);
+        // the SeqCst fetch_sub in `unlock` provides the release ordering
         self.__lock.unlock();
-        // after release the lock we should sync the mem
-        fence(Ordering::SeqCst);
     }
 }
 
@@ -249,11 +354,33 @@ mod tests {
     #[derive(Eq, PartialEq, Debug)]
     struct NonCopy(i32);
 
+    /// `Sync` is `T: Sync` only (not `T: Send`) and the guard is `!Send`;
+    /// the negative bounds are checked by the compile_fail doctests on
+    /// `MutexGuard`.
+    #[test]
+    fn guard_trait_bounds() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<MutexGuard<'static, u32>>();
+        // a Sync + !Send payload, like std's MutexGuard, is still `Sync`
+        assert_sync::<MutexGuard<'static, std::sync::MutexGuard<'static, u32>>>();
+    }
+
     #[test]
     fn smoke() {
         let m = Mutex::new(());
         drop(m.lock().unwrap());
         drop(m.lock().unwrap());
+    }
+
+    #[test]
+    fn test_const_new() {
+        // `static` requires a const initializer, so this proves
+        // `Mutex::new` is a `const fn`
+        static M: Mutex<i32> = Mutex::new(1);
+        let mut g = M.lock().unwrap();
+        *g += 1;
+        drop(g);
+        assert_eq!(*M.lock().unwrap(), 2);
     }
 
     #[test]
@@ -361,6 +488,28 @@ mod tests {
             Err(e) => assert_eq!(*e.into_inner(), NonCopy(10)),
             Ok(x) => panic!("get_mut of poisoned Mutex is Ok: {x:?}"),
         }
+    }
+
+    #[test]
+    fn test_clear_poison() {
+        let m = Arc::new(Mutex::new(NonCopy(10)));
+        let m2 = m.clone();
+        let _ = thread::spawn(move || {
+            let _lock = m2.lock().unwrap();
+            panic!("test panic in inner thread to poison mutex");
+        })
+        .join();
+
+        assert!(m.is_poisoned());
+        m.clear_poison();
+        assert!(!m.is_poisoned());
+        assert_eq!(*m.lock().unwrap(), NonCopy(10));
+    }
+
+    #[test]
+    fn test_from() {
+        let m = Mutex::from(NonCopy(10));
+        assert_eq!(m.into_inner().unwrap(), NonCopy(10));
     }
 
     #[test]
@@ -550,5 +699,64 @@ mod tests {
         h2.join().unwrap();
         let g = mutex1.lock().unwrap();
         assert_eq!(*g, 1);
+    }
+
+    // regression: releasing the lock must walk the chain of released
+    // (canceled) waiters iteratively — a recursive unlock would overflow
+    // the coroutine stack
+    #[test]
+    fn test_mutex_release_chain() {
+        use crate::sleep::sleep;
+        use crate::sync::mpsc::channel;
+        use std::time::Duration;
+
+        const N: usize = 500;
+
+        let m = Arc::new(Mutex::new(()));
+        let m_holder = m.clone();
+        let (tx_held, rx_held) = channel();
+        let (tx_go, rx_go) = channel();
+        // the holder is a coroutine so the release-chain walk runs on the
+        // (small) default coroutine stack; it holds the lock until the test
+        // tells it to release, so the waiters can never acquire the lock
+        let holder = go!(move || {
+            let _g = m_holder.lock().unwrap();
+            tx_held.send(()).unwrap(); // the lock is definitely held now
+            rx_go.recv().unwrap(); // wait until all waiters are canceled
+                                   // dropping the guard at scope end walks the chain
+        });
+
+        // wait until the holder acquired the lock before spawning the
+        // waiters: otherwise a waiter could win the lock race, panic with
+        // unreachable!() before being canceled, and poison the mutex
+        rx_held.recv().unwrap();
+
+        let mut handles = vec![];
+        for _ in 0..N {
+            let m = m.clone();
+            handles.push(go!(move || {
+                let _g = m.lock().unwrap(); // canceled while waiting
+                unreachable!();
+            }));
+        }
+
+        // let all waiters enqueue
+        sleep(Duration::from_millis(100));
+        // cancel all waiters while they are parked on the mutex: each one
+        // registers a release action and then unwinds
+        for h in &handles {
+            unsafe { h.coroutine().cancel() };
+        }
+        for h in handles {
+            assert!(h.join().is_err());
+        }
+
+        // the holder releases the lock and iteratively passes it down the
+        // chain of released waiters
+        tx_go.send(()).unwrap();
+        holder.join().unwrap();
+        // the mutex must be usable afterwards
+        let g = m.lock().unwrap();
+        drop(g);
     }
 }

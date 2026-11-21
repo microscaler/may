@@ -135,12 +135,18 @@ impl Coroutine {
         self.inner.park.unpark();
     }
 
-    /// cancel a coroutine
+    /// Cancels the coroutine.
+    ///
+    /// This forces the coroutine to unwind when it is next scheduled, dropping
+    /// all the resources it currently holds. As with a panic, this may have
+    /// unexpected side effects if the coroutine is not cancellation-safe.
+    ///
     /// # Safety
     ///
-    /// This function would force a coroutine exist when next scheduling
-    /// And would drop all the resource tha the coroutine currently holding
-    /// This may have unexpected side effects if you are not fully aware it
+    /// Calling this function can cause the coroutine to unwind at any point.
+    /// It has the same safety concerns as calling `panic!` inside a coroutine.
+    /// Just be careful when calling this function, and you are fully aware of
+    /// the potential side effects.
     pub unsafe fn cancel(&self) {
         self.inner.cancel.cancel();
     }
@@ -148,13 +154,6 @@ impl Coroutine {
     /// Gets the coroutine name.
     pub fn name(&self) -> Option<&str> {
         self.inner.name.as_deref()
-    }
-
-    /// Get the internal cancel
-    #[cfg(unix)]
-    #[cfg(feature = "io_cancel")]
-    pub(crate) fn get_cancel(&self) -> &Cancel {
-        &self.inner.cancel
     }
 }
 
@@ -173,10 +172,11 @@ impl fmt::Debug for Coroutine {
 ///
 /// Methods can be chained on it in order to configure it.
 ///
-/// The two configurations available are:
+/// The configurations available are:
 ///
 /// - [`name`]: specifies an [associated name for the coroutine][naming-coroutines]
 /// - [`stack_size`]: specifies the [desired stack size for the coroutine][stack-size]
+/// - [`id`]: selects the worker that first runs the coroutine
 ///
 /// The [`spawn`] method will take ownership of the builder and create an
 /// `io::Result` to the coroutine handle with the given configuration.
@@ -206,6 +206,7 @@ impl fmt::Debug for Coroutine {
 /// [`coroutine::spawn`]: ./fn.spawn.html
 /// [`stack_size`]: ./struct.Builder.html#method.stack_size
 /// [`name`]: ./struct.Builder.html#method.name
+/// [`id`]: ./struct.Builder.html#method.id
 /// [`spawn`]: ./struct.Builder.html#method.spawn
 /// [naming-coroutines]: ./index.html#naming-coroutine
 /// [stack-size]: ./index.html#stack-siz
@@ -215,7 +216,7 @@ pub struct Builder {
     name: Option<String>,
     // The size of the stack for the spawned coroutine
     stack_size: Option<usize>,
-    // The associated id of the coroutine, would select a specific thread to run
+    // The worker this coroutine is initially placed on; not a pin
     id: Option<usize>,
 }
 
@@ -243,7 +244,22 @@ impl Builder {
         self
     }
 
-    /// Sets the id of the coroutine, would select a specific thread to run
+    /// Selects the worker that should first run the coroutine.
+    ///
+    /// The coroutine is initially queued for worker `id`, which normally runs
+    /// it first. This is a placement hint, not a pin: work stealing can pick
+    /// it up before that, and once it yields or blocks the normal scheduling
+    /// rules apply. A wakeup delivered on another worker or an io completion
+    /// on the selector that owns the file descriptor can also resume it on a
+    /// different worker.
+    ///
+    /// `id` must be less than the configured worker count; [`spawn`] returns
+    /// an [`InvalidInput`] error otherwise. [`spawn_local`] ignores this
+    /// setting because the coroutine first runs on the calling thread.
+    ///
+    /// [`spawn`]: ./struct.Builder.html#method.spawn
+    /// [`spawn_local`]: ./struct.Builder.html#method.spawn_local
+    /// [`InvalidInput`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.InvalidInput
     pub fn id(mut self, id: usize) -> Builder {
         self.id = Some(id);
         self
@@ -280,8 +296,21 @@ impl Builder {
             // to unwind these local data. for the panic err we would set it in the
             // coroutine local data so that can return from the packet variable
 
+            let result = f();
+
+            // if the coroutine was canceled but the cancel panic never fired
+            // (the cancel was delivered while another unwind was suspended on
+            // this thread, or landed just before completion), report the
+            // cancellation from `join` instead of silently returning `Ok`
+            if crate::coroutine_impl::is_coroutine()
+                && crate::coroutine_impl::current_cancel_data().is_canceled()
+            {
+                their_join.trigger();
+                return subscriber;
+            }
+
             // set the return packet
-            their_packet.store(f());
+            their_packet.store(result);
 
             their_join.trigger();
             subscriber
@@ -351,11 +380,34 @@ impl Builder {
     {
         // we will still get optimizations in spawn_impl
         let id = self.id;
-        let (co, handle) = self.spawn_impl(f)?;
         let s = get_scheduler();
+        if let Some(id) = id {
+            // Reject an id that does not name a worker instead of silently
+            // aliasing it modulo the worker count.
+            if id >= s.workers {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "coroutine worker id {id} is out of range for {} workers",
+                        s.workers
+                    ),
+                ));
+            }
+        }
+        let (co, handle) = self.spawn_impl(f)?;
 
         match id {
-            None => s.schedule_global(co),
+            None => {
+                // When spawning from inside a coroutine the child can go to
+                // the local queue, which needs no wakeup syscall at all.
+                // With work stealing enabled idle workers can still take it.
+                #[cfg(feature = "work_steal")]
+                s.schedule(co);
+                // Without stealing a local push would pin every child to the
+                // spawning worker, so keep the round-robin global spread.
+                #[cfg(not(feature = "work_steal"))]
+                s.schedule_global(co);
+            }
             Some(id) => s.schedule_global_with_id(co, id),
         }
 
@@ -364,6 +416,9 @@ impl Builder {
 
     /// first run the coroutine in current thread, you should always use
     /// `spawn` instead of this API.
+    ///
+    /// The [`Builder::id`] setting is ignored: the coroutine starts on the
+    /// calling thread, and its later scheduling follows the normal rules.
     ///
     /// # Safety
     ///
@@ -478,18 +533,33 @@ pub(crate) fn current_cancel_data() -> &'static Cancel {
     }
 }
 
-#[inline]
-pub(crate) fn co_cancel_data(co: &CoroutineImpl) -> &'static Cancel {
-    let local = unsafe { &*get_co_local(co) };
-    &local.get_co().inner.cancel
+/// Owned access to a coroutine's cancel state.
+///
+/// It holds a `Coroutine` handle, an `Arc<Inner>` clone, so the `Cancel`
+/// stays valid for as long as the guard. A caller may keep using it after
+/// moving `co` into the wait and after the coroutine has been resumed and
+/// completed on another thread; that is when the coroutine's local data
+/// (the last owner of `Inner`) can be dropped.
+pub(crate) struct CoCancel(Coroutine);
+
+impl std::ops::Deref for CoCancel {
+    type Target = Cancel;
+
+    #[inline]
+    fn deref(&self) -> &Cancel {
+        &self.0.inner.cancel
+    }
 }
 
-// windows use delay drop instead
-#[cfg(unix)]
-#[cfg(feature = "io_cancel")]
-pub(crate) fn co_get_handle(co: &CoroutineImpl) -> Coroutine {
+/// Borrow the cancel state of the given coroutine.
+///
+/// The returned guard keeps the coroutine's shared state alive, so it can be
+/// used after `co` has been moved into the wait and the coroutine may have
+/// completed on another thread.
+#[inline]
+pub(crate) fn co_cancel_data(co: &CoroutineImpl) -> CoCancel {
     let local = unsafe { &*get_co_local(co) };
-    local.get_co().clone()
+    CoCancel(local.get_co().clone())
 }
 
 /// timeout block the current coroutine until it's get unparked
@@ -531,6 +601,14 @@ pub(crate) fn run_coroutine(mut co: CoroutineImpl) {
             }
             // trigger the join here
             join.trigger();
+            // if this coroutine was unwinding from a Cancel panic, the
+            // unwind has now completed at the generator boundary and the
+            // thread's panic count has been reset; only then may the flag
+            // be cleared. A normal completion while another coroutine's
+            // unwind is still suspended must keep the flag set.
+            if !std::thread::panicking() {
+                crate::cancel::clear_cancel_panic_flag();
+            }
             Done::drop_coroutine(co);
         }
     }
