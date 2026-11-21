@@ -2,30 +2,34 @@ use std::cmp;
 use std::collections::{BinaryHeap, HashMap};
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use may_queue::mpsc::Queue;
-use may_queue::mpsc_list_v1::Entry;
-use may_queue::mpsc_list_v1::Queue as TimeoutQueue;
+use may_queue::mpsc_list_v1::{self, Entry, Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 
-use crate::sync::AtomicOption;
+use crate::timer_parker::Parker;
 
 const HASH_CAP: usize = 1024;
 
 #[inline]
 fn get_instant() -> &'static Instant {
-    use std::mem::MaybeUninit;
-    static START_TIME: MaybeUninit<Instant> = MaybeUninit::zeroed();
-    unsafe { START_TIME.assume_init_ref() }
+    static START_TIME: OnceLock<Instant> = OnceLock::new();
+    START_TIME.get_or_init(Instant::now)
 }
 // get the current wall clock in ns
 #[inline]
 pub fn now() -> u64 {
     // we need a Monotonic Clock here
-    get_instant().elapsed().as_nanos() as u64
+    get_instant().elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+#[inline]
+fn timeout_deadline(now: u64, dur: Duration) -> (u64, u64) {
+    let interval = dur.as_nanos().min(u64::MAX.saturating_sub(now) as u128) as u64;
+    (interval, now + interval)
 }
 
 // timeout event data
@@ -38,20 +42,32 @@ pub struct TimeoutData<T> {
 pub type TimeoutHandle<T> = Entry<TimeoutData<T>>;
 
 struct TimeoutQueueWrapper<T> {
-    inner: TimeoutQueue<TimeoutData<T>>,
+    sender: Sender<TimeoutData<T>>,
+    // the receiver is `!Sync`, the wrapper itself is shared between the
+    // producers and the consuming timer thread, so serializing access keeps
+    // the single-consumer invariant
+    receiver: Mutex<Receiver<TimeoutData<T>>>,
     in_use: AtomicUsize,
 }
 
 impl<T> TimeoutQueueWrapper<T> {
     fn new() -> Self {
+        let (sender, receiver) = mpsc_list_v1::channel();
         TimeoutQueueWrapper {
-            inner: TimeoutQueue::new(),
+            sender,
+            receiver: Mutex::new(receiver),
             in_use: AtomicUsize::new(0),
         }
     }
 }
 
 type IntervalList<T> = Arc<TimeoutQueueWrapper<T>>;
+
+// the lists are shared between the producers and the consuming timer thread
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<TimeoutQueueWrapper<()>>();
+};
 
 // this is the data type that used by the binary heap to get the latest timer
 struct IntervalEntry<T> {
@@ -68,10 +84,15 @@ impl<T> IntervalEntry<T> {
         F: Fn(T),
     {
         let p = |v: &TimeoutData<T>| v.time <= now;
-        while let Some(timeout) = self.list.inner.pop_if(&p) {
-            f(timeout.data);
+        // do not hold the receiver lock while running the timeout handler
+        loop {
+            let timeout = self.list.receiver.lock().pop_if(&p);
+            match timeout {
+                Some(timeout) => f(timeout.data),
+                None => break,
+            }
         }
-        unsafe { self.list.inner.peek() }.map(|t| t.time)
+        self.list.receiver.lock().peek_with(|t| t.time)
     }
 }
 
@@ -119,10 +140,11 @@ impl<T> TimeOutList<T> {
 
     // add a timeout event to the list
     // this can be called in any thread
-    // return true if we need to recall next expire
-    pub fn add_timer(&self, dur: Duration, data: T) -> (TimeoutHandle<T>, bool) {
-        let interval = dur.as_nanos() as u64;
-        let time = now() + interval;
+    // return the handle, whether the new node became the head of its interval
+    // list (only then may the selector's next wake need updating), and the
+    // absolute expiration time of the node
+    pub fn add_timer(&self, dur: Duration, data: T) -> (TimeoutHandle<T>, bool, u64) {
+        let (interval, time) = timeout_deadline(now(), dur);
         //println!("add timer = {:?}", time);
 
         let timeout = TimeoutData { time, data };
@@ -135,7 +157,7 @@ impl<T> TimeOutList<T> {
         };
 
         if let Some(interval_list) = interval_list {
-            let (handle, is_head) = interval_list.inner.push(timeout);
+            let (handle, is_head) = interval_list.sender.push(timeout);
             if is_head {
                 // install the interval list to the binary heap
                 self.install_timer_bh(IntervalEntry {
@@ -144,7 +166,7 @@ impl<T> TimeOutList<T> {
                     list: interval_list,
                 });
             }
-            return (handle, is_head);
+            return (handle, is_head, time);
         }
 
         // if the interval list is not there, get the write locker to install the list
@@ -152,7 +174,7 @@ impl<T> TimeOutList<T> {
         let mut interval_map_w = self.interval_map.write();
         // recheck the interval list in case other thread may install it
         if let Some(interval_list) = (*interval_map_w).get(&interval) {
-            let (handle, is_head) = interval_list.inner.push(timeout);
+            let (handle, is_head) = interval_list.sender.push(timeout);
             if is_head {
                 // this rarely happens
                 self.install_timer_bh(IntervalEntry {
@@ -161,11 +183,11 @@ impl<T> TimeOutList<T> {
                     list: interval_list.clone(),
                 });
             }
-            return (handle, is_head);
+            return (handle, is_head, time);
         }
 
         let interval_list = Arc::new(TimeoutQueueWrapper::<T>::new());
-        let ret = interval_list.inner.push(timeout).0;
+        let ret = interval_list.sender.push(timeout).0;
         (*interval_map_w).insert(interval, interval_list.clone());
         // drop the write lock here
         mem::drop(interval_map_w);
@@ -177,7 +199,7 @@ impl<T> TimeOutList<T> {
             list: interval_list,
         });
 
-        (ret, true)
+        (ret, true, time)
     }
 
     // schedule in the timer thread
@@ -217,19 +239,26 @@ impl<T> TimeOutList<T> {
                 None => {
                     // if the interval list is empty, need to delete it
                     let mut interval_map_w = self.interval_map.write();
-                    // recheck if the interval list is empty, other thread may append data to it
-                    if entry.list.inner.is_empty() {
-                        // if the len of the hash map is big enough just leave the queue there
-                        if (*interval_map_w).len() > HASH_CAP {
-                            // the list is really empty now, we can safely remove it
-                            (*interval_map_w).remove(&entry.interval);
+                    // recheck the list, other thread may append data to it.
+                    // nodes removed by a handle stay linked until the consumer
+                    // retires them, so skip those tombstones here
+                    let next_time = entry.list.receiver.lock().peek_with(|t| t.time);
+                    match next_time {
+                        Some(time) => {
+                            if entry.list.in_use.fetch_add(1, Ordering::AcqRel) == 0 {
+                                // release the w lock first, we don't need it any more
+                                mem::drop(interval_map_w);
+                                entry.time = time;
+                                self.timer_bh.lock().push(entry);
+                            }
                         }
-                    } else if entry.list.in_use.fetch_add(1, Ordering::AcqRel) == 0 {
-                        // release the w lock first, we don't need it any more
-                        mem::drop(interval_map_w);
-                        // the list is push some data by other thread
-                        entry.time = unsafe { entry.list.inner.peek() }.unwrap().time;
-                        self.timer_bh.lock().push(entry);
+                        None => {
+                            // if the len of the hash map is big enough just leave the queue there
+                            if (*interval_map_w).len() > HASH_CAP {
+                                // the list is really empty now, we can safely remove it
+                                (*interval_map_w).remove(&entry.interval);
+                            }
+                        }
                     }
                 }
             }
@@ -242,7 +271,7 @@ pub struct TimerThread<T> {
     // collect the remove request
     remove_list: Queue<TimeoutHandle<T>>,
     // the timer thread wakeup handler
-    wakeup: AtomicOption<Arc<thread::Thread>>,
+    parker: Parker,
 }
 
 impl<T> TimerThread<T> {
@@ -250,26 +279,22 @@ impl<T> TimerThread<T> {
         TimerThread {
             timer_list: TimeOutList::new(),
             remove_list: Queue::new(),
-            wakeup: AtomicOption::none(),
+            parker: Parker::new(),
         }
     }
 
     pub fn add_timer(&self, dur: Duration, data: T) -> TimeoutHandle<T> {
-        let (h, is_recal) = self.timer_list.add_timer(dur, data);
+        let (h, is_recal, _) = self.timer_list.add_timer(dur, data);
         // wake up the timer thread if it's a new queue
         if is_recal {
-            if let Some(t) = self.wakeup.take() {
-                t.unpark();
-            }
+            self.parker.notify();
         }
         h
     }
 
     pub fn del_timer(&self, handle: TimeoutHandle<T>) {
         self.remove_list.push(handle);
-        if let Some(t) = self.wakeup.take() {
-            t.unpark();
-        }
+        self.parker.notify();
     }
 
     // the timer thread function
@@ -279,19 +304,18 @@ impl<T> TimerThread<T> {
             while let Some(h) = self.remove_list.pop() {
                 h.remove();
             }
-            // we must register the thread handle first
-            // or there will be no signal to wakeup the timer thread
-            self.wakeup.store(current_thread.clone());
-
+            // We must register the thread handle first or there will be no
+            // signal to wake up the timer thread. A producer that queued work
+            // before the registration found the slot empty and could not
+            // wake us, so re-check for queued removals and wake ourselves.
+            self.parker.arm(&current_thread);
             if !self.remove_list.is_empty() {
-                if let Some(t) = self.wakeup.take() {
-                    t.unpark();
-                }
+                self.parker.notify();
             }
 
             match self.timer_list.schedule_timer(now(), f) {
-                Some(time) => thread::park_timeout(Duration::from_nanos(time)),
-                None => thread::park(),
+                Some(time) => self.parker.park(Some(Duration::from_nanos(time))),
+                None => self.parker.park(None),
             }
         }
     }
@@ -300,6 +324,23 @@ impl<T> TimerThread<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_deadline_saturates_for_unrepresentable_durations() {
+        assert_eq!(
+            timeout_deadline(10, Duration::from_nanos(u64::MAX)),
+            (u64::MAX - 10, u64::MAX)
+        );
+        assert_eq!(
+            timeout_deadline(10, Duration::MAX),
+            (u64::MAX - 10, u64::MAX)
+        );
+        assert_eq!(timeout_deadline(10, Duration::from_nanos(5)), (5, 15));
+        assert_eq!(
+            timeout_deadline(u64::MAX, Duration::from_secs(1)),
+            (0, u64::MAX)
+        );
+    }
 
     #[test]
     fn test_timeout_list() {

@@ -1,16 +1,48 @@
+use std::cell::Cell;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 
-use crate::coroutine_impl::CoroutineImpl;
 #[cfg(feature = "io_cancel")]
 use crate::io::cancel::CancelIoImpl;
 use crate::likely::unlikely;
 use crate::scheduler::get_scheduler;
-use crate::sync::AtomicOption;
+use crate::sync::{AtomicOption, WaitCo};
 use crate::yield_now::{get_co_para, set_co_para};
 use generator::Error;
+
+// a cancel panic is in flight on this thread: a coroutine's unwind from a
+// Cancel panic can be suspended (a Drop that parks), during which
+// `thread::panicking()` stays true for the whole thread while other
+// coroutines keep running on it. The flag distinguishes that window from a
+// real (non-cancel) panic so that:
+// - `poison::done` does not spuriously poison locks whose guards are
+//   dropped by other coroutines during the window
+// - the unwinding coroutine's own drops never re-trigger the cancel panic
+thread_local! {
+    static CANCEL_PANICKING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// true if a Cancel-panic unwind is currently in flight on this thread
+#[inline]
+pub(crate) fn cancel_panic_in_flight() -> bool {
+    CANCEL_PANICKING.with(|f| f.get())
+}
+
+/// mark that a Cancel-panic unwind started on this thread
+/// called by `trigger_cancel_panic`, cleared when the coroutine completes
+/// in `run_coroutine`
+#[inline]
+fn set_cancel_panic_flag() {
+    CANCEL_PANICKING.with(|f| f.set(true));
+}
+
+/// clear the Cancel-panic flag once the unwind has completed
+/// idempotent, called from `run_coroutine` on every coroutine completion
+#[inline]
+pub(crate) fn clear_cancel_panic_flag() {
+    CANCEL_PANICKING.with(|f| f.set(false));
+}
 
 // the cancel is implemented by triggering a Cancel panic
 // if drop is called due to a Cancel panic, it's not safe
@@ -23,6 +55,9 @@ pub fn trigger_cancel_panic() -> ! {
     // if thread::panicking() {
     //     eprintln!("trigger another panic while panicking");
     // }
+    if crate::coroutine_impl::is_coroutine() {
+        set_cancel_panic_flag();
+    }
 
     // should we clear the cancel flag to let other API continue?
     // so that we can avoid the re-panic problem?
@@ -34,12 +69,13 @@ pub fn trigger_cancel_panic() -> ! {
 pub trait CancelIo {
     type Data;
     fn new() -> Self;
-    // set the io data
+    // set the io data; only the `io_cancel` io adapters publish it
+    #[cfg(feature = "io_cancel")]
     fn set(&self, io_data: Self::Data);
     // clear the io data
     fn clear(&self);
-    // if io was set, return Some(io::Result<()>)
-    unsafe fn cancel(&self) -> Option<io::Result<()>>;
+    // return true if co is grabbed by cancel successfully
+    fn cancel(&self) -> bool;
 }
 
 #[cfg(not(feature = "io_cancel"))]
@@ -51,10 +87,9 @@ impl CancelIo for CancelIoImpl {
     fn new() -> Self {
         CancelIoImpl
     }
-    fn set(&self, _: Self::Data) {}
     fn clear(&self) {}
-    unsafe fn cancel(&self) -> Option<io::Result<()>> {
-        None
+    fn cancel(&self) -> bool {
+        false
     }
 }
 
@@ -68,7 +103,7 @@ pub struct CancelImpl<T: CancelIo> {
     // other suspended type would register the co itself
     // can't set io and co at the same time!
     // most of the time this is park based API
-    co: AtomicOption<Arc<AtomicOption<CoroutineImpl>>>,
+    co: AtomicOption<WaitCo>,
 }
 
 impl<T: CancelIo> Default for CancelImpl<T> {
@@ -93,6 +128,7 @@ impl<T: CancelIo> CancelImpl<T> {
     }
 
     // return if the coroutine cancel is disabled
+    #[allow(dead_code)]
     pub fn is_disabled(&self) -> bool {
         self.state.load(Ordering::Acquire) >= 2
     }
@@ -109,7 +145,7 @@ impl<T: CancelIo> CancelImpl<T> {
 
     // panic if cancel was set
     pub fn check_cancel(&self) {
-        if unlikely(self.state.load(Ordering::Acquire) == 1) {
+        if unlikely(self.is_canceled()) {
             // before panic clear the last coroutine error
             // this would affect future new coroutine that reuse the instance
             get_co_para();
@@ -122,10 +158,18 @@ impl<T: CancelIo> CancelImpl<T> {
 
     // async cancel for a coroutine
     #[cold]
-    pub unsafe fn cancel(&self) {
+    pub fn cancel(&self) {
         self.state.fetch_or(1, Ordering::Release);
+        // The canceller half of the register-then-check handshake whose
+        // waiter half is the fence in `set_io`/`set_co`. The waiter stores
+        // its registration and then reads the cancel bit; with only a
+        // release store and an acquire load on each side, store buffering
+        // lets the waiter miss the bit while this take misses the
+        // registration, dropping the cancellation and leaving the coroutine
+        // parked.
+        std::sync::atomic::fence(Ordering::SeqCst);
 
-        if let Some(Ok(())) = self.io.cancel() {
+        if self.io.cancel() {
             // successfully canceled
             return;
         }
@@ -140,23 +184,22 @@ impl<T: CancelIo> CancelImpl<T> {
         }
     }
 
-    // clear the cancel bit so that we can reuse the cancel
-    #[cfg(unix)]
-    pub fn clear_cancel_bit(&self) {
-        self.state.fetch_and(!1, Ordering::Release);
-    }
-
     // set the cancel io data
     // should be called after register io request
     #[cfg(feature = "io_cancel")]
     pub fn set_io(&self, io: T::Data) {
-        self.io.set(io)
+        self.io.set(io);
+        // pair with the fence in `cancel`: the registration must be ordered
+        // before the `is_canceled` load that the caller does next
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     // set the cancel co data
     // can't both set_io and set_co
-    pub fn set_co(&self, co: Arc<AtomicOption<CoroutineImpl>>) {
+    pub fn set_co(&self, co: WaitCo) {
         self.co.store(co);
+        // pair with the fence in `cancel`, as in `set_io`
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     // clear the cancel io data

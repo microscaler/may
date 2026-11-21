@@ -64,22 +64,26 @@ impl EventSource for UnixListenerAccept<'_> {
         let cancel = co_cancel_data(&co);
         let io_data = self.io_data;
 
-        // if there is no timer we don't need to call add_io_timer
-        io_data.co.store(co);
+        // accept waits have no timeout
+        let (event_data, wait) = io_data.publish_co(
+            co,
+            #[cfg(feature = "io_timeout")]
+            None,
+        );
 
         // there is event happened
-        if io_data.io_flag.load(Ordering::Acquire) != 0 {
+        if event_data.io_flag.load(Ordering::Acquire) != 0 {
             #[allow(clippy::needless_return)]
-            return io_data.fast_schedule();
+            return event_data.fast_schedule(&wait);
         }
 
         #[cfg(feature = "io_cancel")]
         {
-            // register the cancel io data
-            cancel.set_io((*io_data).clone());
+            // register the cancel wait
+            cancel.set_io(wait);
             // re-check the cancel status
             if cancel.is_canceled() {
-                unsafe { cancel.cancel() };
+                cancel.cancel();
             }
         }
     }

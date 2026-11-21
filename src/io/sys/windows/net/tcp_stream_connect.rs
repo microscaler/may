@@ -1,6 +1,7 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::os::windows::io::AsRawSocket;
+use std::sync::Arc;
 #[cfg(feature = "io_timeout")]
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use crate::sync::delay_drop::DelayDrop;
 use windows_sys::Win32::Foundation::*;
 
 pub struct TcpStreamConnect {
-    io_data: EventData,
+    io_data: Arc<EventData>,
     stream: OptionCell<std::net::TcpStream>,
     #[cfg(feature = "io_timeout")]
     timeout: Option<Duration>,
@@ -34,9 +35,10 @@ impl TcpStreamConnect {
     ) -> io::Result<Self> {
         use socket2::{Domain, Socket, Type};
 
-        // TODO:
-        // resolve addr is a blocking operation!
-        // here we should use a thread to finish the resolve?
+        // Address resolution is blocking. A hostname lookup runs here, in the
+        // calling worker (or thread), before the connect is submitted, so it
+        // can stall that worker's event loop. Pre-resolved `SocketAddr`s (and
+        // `connect_timeout`, which takes one) do not invoke the resolver.
         addr.to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::other("no socket addresses resolved"))
@@ -67,7 +69,7 @@ impl TcpStreamConnect {
                         // must register io first
                         s.set_nonblocking(true)?;
                         add_socket(&s).map(|_io| TcpStreamConnect {
-                            io_data: EventData::new(s.as_raw_socket() as HANDLE),
+                            io_data: Arc::new(EventData::new(s.as_raw_socket() as HANDLE)),
                             addr,
                             stream: OptionCell::new(s),
                             #[cfg(feature = "io_timeout")]
@@ -81,11 +83,30 @@ impl TcpStreamConnect {
     }
 
     pub fn done(&mut self) -> io::Result<TcpStream> {
-        co_io_result(&self.io_data, self.is_coroutine)?;
+        co_io_result(&self.io_data, self.is_coroutine).map_err(winsock_error)?;
         let stream = self.stream.take();
         connect_complete(stream.as_raw_socket())?;
         Ok(TcpStream::from_stream(stream, IoData))
     }
+}
+
+/// ConnectEx completes with Win32 codes (`ERROR_CONNECTION_REFUSED`, 1225, and the like), which std
+/// maps to `ErrorKind::Uncategorized`; std's own `TcpStream::connect` reports the Winsock codes
+/// (`WSAECONNREFUSED`, 10061: `ConnectionRefused`). Report the Winsock code so a refused or
+/// unreachable connect has the same kind from may as from std, on Windows as on unix.
+fn winsock_error(e: io::Error) -> io::Error {
+    const WSAENETUNREACH: i32 = 10051;
+    const WSAETIMEDOUT: i32 = 10060;
+    const WSAECONNREFUSED: i32 = 10061;
+    const WSAEHOSTUNREACH: i32 = 10065;
+    let code = match e.raw_os_error().map(|c| c as u32) {
+        Some(ERROR_CONNECTION_REFUSED) => WSAECONNREFUSED,
+        Some(ERROR_NETWORK_UNREACHABLE) => WSAENETUNREACH,
+        Some(ERROR_HOST_UNREACHABLE) => WSAEHOSTUNREACH,
+        Some(ERROR_SEM_TIMEOUT) => WSAETIMEDOUT,
+        _ => return e,
+    };
+    io::Error::from_raw_os_error(code)
 }
 
 impl EventSource for TcpStreamConnect {
@@ -96,9 +117,9 @@ impl EventSource for TcpStreamConnect {
         let cancel = co_cancel_data(&co);
         #[cfg(feature = "io_timeout")]
         if let Some(dur) = self.timeout {
-            s.get_selector().add_io_timer(&mut self.io_data, dur);
+            s.get_selector().add_io_timer(&self.io_data, dur);
         }
-        self.io_data.co = Some(co);
+        self.io_data.co.store(co);
 
         // call the overlapped connect API
         co_try!(s, self.io_data.co.take().expect("can't get co"), unsafe {
@@ -110,13 +131,19 @@ impl EventSource for TcpStreamConnect {
             )
         });
 
+        // a timer that fired while the request was being submitted could not
+        // cancel it yet, finish the cancellation now that it is pending; the
+        // `can_drop` guard keeps this frame alive until `subscribe` returns
+        #[cfg(feature = "io_timeout")]
+        self.io_data.cancel_if_timed_out();
+
         #[cfg(feature = "io_cancel")]
         {
             // register the cancel io data
             cancel.set_io(CancelIoData::new(&self.io_data));
             // re-check the cancel status
             if cancel.is_canceled() {
-                unsafe { cancel.cancel() };
+                cancel.cancel();
             }
         }
     }

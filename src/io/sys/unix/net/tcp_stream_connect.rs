@@ -30,7 +30,10 @@ impl TcpStreamConnect {
     ) -> io::Result<Self> {
         use socket2::{Domain, Type};
 
-        // let err = io::Error::new(io::ErrorKind::Other, "no socket addresses resolved");
+        // Address resolution is blocking. A hostname lookup runs here, in the
+        // calling worker (or thread), before the connect is submitted, so it
+        // can stall that worker's event loop. Pre-resolved `SocketAddr`s (and
+        // `connect_timeout`, which takes one) do not invoke the resolver.
         addr.to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::other("no socket addresses resolved"))
@@ -89,6 +92,14 @@ impl TcpStreamConnect {
             // clear the io_flag
             self.io_data.io_flag.store(0, Ordering::Relaxed);
 
+            // An asynchronous connect that failed leaves its error in SO_ERROR. Linux also reports
+            // it from the connect() below; macOS does not (that connect succeeds or says
+            // EISCONN), so a refused connect came back as a connected stream whose first write
+            // failed with EPIPE (BrokenPipe). SO_ERROR first, on every platform.
+            if let Some(e) = self.stream.take_error()? {
+                return Err(e);
+            }
+
             match self.stream.connect(&self.addr.into()) {
                 Ok(_) => return Ok(convert_to_stream(self)),
                 Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
@@ -113,29 +124,29 @@ impl EventSource for TcpStreamConnect {
     fn subscribe(&mut self, co: CoroutineImpl) {
         #[cfg(feature = "io_cancel")]
         let cancel = co_cancel_data(&co);
-        let io_data = &self.io_data;
 
-        #[cfg(feature = "io_timeout")]
-        if let Some(dur) = self.timeout {
-            crate::scheduler::get_scheduler()
-                .get_selector()
-                .add_io_timer(&self.io_data, dur);
-        }
-        io_data.co.store(co);
+        // the timer holds its own clone of the wait slot, so an immediate
+        // expiry still reaches the coroutine; after publishing, only use the
+        // shared event data, the resumed coroutine may take the io data
+        let (event_data, wait) = self.io_data.publish_co(
+            co,
+            #[cfg(feature = "io_timeout")]
+            self.timeout,
+        );
 
         // there is event, re-run the coroutine
-        if io_data.io_flag.load(Ordering::Acquire) != 0 {
+        if event_data.io_flag.load(Ordering::Acquire) != 0 {
             #[allow(clippy::needless_return)]
-            return io_data.fast_schedule();
+            return event_data.fast_schedule(&wait);
         }
 
         #[cfg(feature = "io_cancel")]
         {
-            // register the cancel io data
-            cancel.set_io((*io_data).clone());
+            // register the cancel wait
+            cancel.set_io(wait);
             // re-check the cancel status
             if cancel.is_canceled() {
-                unsafe { cancel.cancel() };
+                cancel.cancel();
             }
         }
     }

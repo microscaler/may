@@ -1,6 +1,6 @@
 [package]
 name = "may"
-version = "0.3.51"
+version = "0.3.52"
 edition = "2021"
 authors = ["Xudong Huang <huangxu008@hotmail.com>"]
 license = "MIT/Apache-2.0"
@@ -28,16 +28,16 @@ log = "0.4"
 cfg-if = "1"
 num_cpus = "1"
 smallvec = "1"
-generator = "0.8.9"
+generator = "0.8.12"
 crossbeam = "0.8"
-parking_lot = "0.12"
+parking_lot = "0.13"
 core_affinity = "0.8"
 socket2 = { version = "0.6", features = ["all"] }
 fastrand = { version = "2.0", optional = true }
-may_queue = { version = "0.1", path = "may_queue" }
+may_queue = { version = "0.2", path = "may_queue" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["event", "socket"] }
+nix = { version = "0.32", features = ["event", "socket"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
@@ -68,8 +68,7 @@ serde_derive = "1.0"
 default = ["io_cancel", "io_timeout", "work_steal"]
 io_cancel = []
 io_timeout = []
-work_steal = []
-rand_work_steal = ["work_steal", "dep:fastrand"]
+work_steal = ["dep:fastrand"]
 crossbeam_queue_steal = ["work_steal"]
 
 

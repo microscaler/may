@@ -1,5 +1,6 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::sync::Arc;
 #[cfg(feature = "io_timeout")]
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use crate::sync::delay_drop::DelayDrop;
 use windows_sys::Win32::Foundation::*;
 
 pub struct PipeRead<'a> {
-    io_data: EventData,
+    io_data: Arc<EventData>,
     buf: &'a mut [u8],
     pipe: RawHandle,
     #[cfg(feature = "io_timeout")]
@@ -32,7 +33,7 @@ impl<'a> PipeRead<'a> {
     ) -> Self {
         let pipe = s.as_raw_handle();
         PipeRead {
-            io_data: EventData::new(pipe),
+            io_data: Arc::new(EventData::new(pipe)),
             buf,
             pipe,
             #[cfg(feature = "io_timeout")]
@@ -57,20 +58,25 @@ impl EventSource for PipeRead<'_> {
         #[cfg(feature = "io_cancel")]
         let cancel = co_cancel_data(&co);
         let _g = self.can_drop.delay_drop();
-        // if the event happened before this there would be something wrong
-        // that the timer handle can't be removed in time
-        // we must prepare the timer before call the API
+        // prepare the timer before the API: if it fires while the request is
+        // still being submitted it is completed by `cancel_if_timed_out`
         #[cfg(feature = "io_timeout")]
         if let Some(dur) = self.timeout {
-            s.get_selector().add_io_timer(&mut self.io_data, dur);
+            s.get_selector().add_io_timer(&self.io_data, dur);
         }
         // prepare the co first
-        self.io_data.co = Some(co);
+        self.io_data.co.store(co);
 
         // call the overlapped read API
         co_try!(s, self.io_data.co.take().expect("can't get co"), unsafe {
             pipe_read_overlapped(self.pipe, self.buf, self.io_data.get_overlapped())
         });
+
+        // a timer that fired while the request was being submitted could not
+        // cancel it yet, finish the cancellation now that it is pending; the
+        // `can_drop` guard keeps this frame alive until `subscribe` returns
+        #[cfg(feature = "io_timeout")]
+        self.io_data.cancel_if_timed_out();
 
         #[cfg(feature = "io_cancel")]
         {
@@ -78,7 +84,7 @@ impl EventSource for PipeRead<'_> {
             cancel.set_io(CancelIoData::new(&self.io_data));
             // re-check the cancel status
             if cancel.is_canceled() {
-                unsafe { cancel.cancel() };
+                cancel.cancel();
             }
         }
     }
