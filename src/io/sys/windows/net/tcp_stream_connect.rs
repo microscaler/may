@@ -83,11 +83,30 @@ impl TcpStreamConnect {
     }
 
     pub fn done(&mut self) -> io::Result<TcpStream> {
-        co_io_result(&self.io_data, self.is_coroutine)?;
+        co_io_result(&self.io_data, self.is_coroutine).map_err(winsock_error)?;
         let stream = self.stream.take();
         connect_complete(stream.as_raw_socket())?;
         Ok(TcpStream::from_stream(stream, IoData))
     }
+}
+
+/// ConnectEx completes with Win32 codes (`ERROR_CONNECTION_REFUSED`, 1225, and the like), which std
+/// maps to `ErrorKind::Uncategorized`; std's own `TcpStream::connect` reports the Winsock codes
+/// (`WSAECONNREFUSED`, 10061: `ConnectionRefused`). Report the Winsock code so a refused or
+/// unreachable connect has the same kind from may as from std, on Windows as on unix.
+fn winsock_error(e: io::Error) -> io::Error {
+    const WSAENETUNREACH: i32 = 10051;
+    const WSAETIMEDOUT: i32 = 10060;
+    const WSAECONNREFUSED: i32 = 10061;
+    const WSAEHOSTUNREACH: i32 = 10065;
+    let code = match e.raw_os_error().map(|c| c as u32) {
+        Some(ERROR_CONNECTION_REFUSED) => WSAECONNREFUSED,
+        Some(ERROR_NETWORK_UNREACHABLE) => WSAENETUNREACH,
+        Some(ERROR_HOST_UNREACHABLE) => WSAEHOSTUNREACH,
+        Some(ERROR_SEM_TIMEOUT) => WSAETIMEDOUT,
+        _ => return e,
+    };
+    io::Error::from_raw_os_error(code)
 }
 
 impl EventSource for TcpStreamConnect {
